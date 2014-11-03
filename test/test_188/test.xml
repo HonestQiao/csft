@@ -8,8 +8,6 @@
 <id32/>
 </requires>
 
-<skip_indexer/>
-
 <config>
 
 searchd
@@ -24,6 +22,7 @@ index v2
 	path			= data/rt_v2
 	rt_field		= content
 	rt_attr_uint	= idd
+	dict			= crc
 }
 
 index v3
@@ -32,6 +31,7 @@ index v3
 	path			= data/rt_v3
 	rt_field		= content
 	rt_attr_uint	= idd
+	dict			= crc
 }
 
 index v4
@@ -40,6 +40,7 @@ index v4
 	path			= data/rt_v4
 	rt_field		= content
 	rt_attr_uint	= idd
+	dict			= crc
 }
 
 index v5
@@ -48,7 +49,33 @@ index v5
 	path			= data/rt_v5
 	rt_field		= content
 	rt_attr_uint	= idd
+	dict			= crc
 }
+
+source plain_stem_src
+{
+	type			= mysql
+	<sql_settings/>
+	sql_query		= select 1, 11 as gid, 'apple' as title
+	sql_attr_uint	= gid
+}
+index plain_stem
+{
+	source			= plain_stem_src
+	path			= <data_path/>/plain_stem
+	docinfo			= extern
+	morphology = stem_en
+	dict			= crc
+}
+index rt_stem
+{
+	type			= rt
+	path			= <data_path/>/rt_stem
+	rt_attr_uint	= gid
+	rt_field		= title
+	morphology = stem_en
+	dict			= crc
+} 
 
 </config>
 
@@ -161,6 +188,17 @@ $results = array_merge ( $results, $query ( "show meta", $sock ) );
 $results = array_merge ( $results, $query ( "select * from v5 where match ( 'test700 | test1800' )", $sock ) );
 $results = array_merge ( $results, $query ( "show meta", $sock ) );
 
+$results = array_merge ( $results, $query ( "CALL KEYWORDS ( 'apple', 'plain_stem', 1 )", $sock ) );
+$results = array_merge ( $results, $query ( "CALL KEYWORDS ( 'apple', 'rt_stem', 1 )", $sock ) );
+$results = array_merge ( $results, $query ( "ATTACH INDEX plain_stem TO RTINDEX rt_stem", $sock ) );
+$results = array_merge ( $results, $query ( "UPDATE rt_stem SET gid=111 WHERE id=1", $sock ) );
+
+// regression plain unavailable after ATTACH till daemon restart
+$results = array_merge ( $results, $query ( "SELECT * FROM plain_stem", $sock ) );
+RunIndexer ( $errors, '--rotate plain_stem' );
+sleep(2);
+$results = array_merge ( $results, $query ( "SELECT * FROM plain_stem", $sock ) );
+
 $close ( $sock );
 
 $results = array_merge ( $results, $restartDaemon ( $client ) );
@@ -171,6 +209,16 @@ $results = array_merge ( $results, $insert ( "v5", 1, 20, $query, $sock ) );
 
 $results = array_merge ( $results, $query ( "select * from v5 where match ( 'test700 | test1800')", $sock ) );
 $results = array_merge ( $results, $query ( "show meta", $sock ) );
+
+$results = array_merge ( $results, $query ( "CALL KEYWORDS ( 'apple', 'rt_stem', 1 )", $sock ) );
+$results = array_merge ( $results, $query ( "SELECT * FROM rt_stem", $sock ) );
+
+// TRUNCATE vs ATTACH
+$results = array_merge ( $results, $query ( "DELETE FROM rt_stem WHERE id=1", $sock ) );
+$results = array_merge ( $results, $query ( "SELECT * FROM rt_stem", $sock ) );
+$results = array_merge ( $results, $query ( "TRUNCATE RTINDEX rt_stem", $sock ) );
+$results = array_merge ( $results, $query ( "ATTACH INDEX plain_stem TO RTINDEX rt_stem", $sock ) );
+$results = array_merge ( $results, $query ( "SELECT * FROM rt_stem", $sock ) );
 
 $close ( $sock );
 

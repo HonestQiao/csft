@@ -11,11 +11,29 @@
 searchd
 {
 	<searchd_settings/>
+	expansion_limit = 2
+	seamless_rotate = 0
 	<dynamic>
-		<variant>workers = none</variant>
+		<variant>
+			seamless_rotate = 0
+			workers = none
+		</variant>
+		<variant>
+			seamless_rotate = 0
+			workers = threads
+			binlog_path =
+		</variant>
 		<variant>
 			workers = threads
 			binlog_path =
+			preopen_indexes = 1
+			seamless_rotate = 0
+		</variant>
+		<variant>
+			workers = threads
+			binlog_path =
+			preopen_indexes = 1
+			seamless_rotate = 1
 		</variant>
 	</dynamic>
 }
@@ -32,6 +50,47 @@ index index
 {
 	source = sql
 	path = <data_path/>/index
+}
+
+source locs
+{
+	type = mysql
+	<sql_settings/>
+
+	sql_query = select id, text from test_table;
+}
+
+index loc1
+{
+	source = locs
+	path = <data_path/>/loc1
+}
+
+index loc2
+{
+	source = locs
+	path = <data_path/>/loc2
+}
+
+index loc3
+{
+	source = locs
+	path = <data_path/>/loc3
+}
+
+source src_expand
+{
+	type = mysql
+	<sql_settings/>
+	sql_query = select 1, 'as' text UNION select 2, 'ask as' text UNION select 3, 'all' text UNION select 4, 'after ask' text
+}
+
+index expand
+{
+	source = src_expand
+	path = <data_path/>/expand
+	dict = keywords
+	min_prefix_len = 1
 }
 </config>
 
@@ -63,13 +122,39 @@ insert into test_table values
 
 <custom_test><![CDATA[
 
-$query = create_function('$client,$words','$result = $client->Query ( $words );	if ( $result ) { unset ( $result["time"] ); return $result; } else return $client->GetLastError(); ');
+$query = create_function('$client,$words','
+$result = $client->Query ( $words, "index" );	if ( $result ) { unset ( $result["time"] ); return $result; } else return $client->GetLastError();
+');
+
+$mquery = create_function('$client','
+$client->AddQuery ( "second", "loc1" );
+$client->AddQuery ( "fifth", "loc2" );
+$client->AddQuery ( "third", "loc3" );
+	
+$res = $client->RunQueries ();
+if ( !$res )
+	return $client->GetLastError();
+	
+$result = array ();
+for ( $i=0; $i<count($res); $i++ ) 
+{
+	unset ( $res[$i]["time"] );
+	$result[] = $res[$i];
+}
+return $result;
+');
+
+$q1 = create_function('$client,$words,$index','
+$result = $client->Query ( $words, $index );	if ( $result ) { unset ( $result["time"] ); return $result; } else return $client->GetLastError();
+');
 
 $results = array();
 $errors = '';
 
 $results[] = $query ( $client, 'first' );
 $results[] = $query ( $client, 'one' );
+$results[] = $mquery ( $client );
+$results[] = $q1 ( $client, 'a*', 'expand' );
 
 mysql_query ( 'update test_table set mode = 3 where id = 1000' );
 RunIndexer ( $errors, '--all --rotate' );
@@ -77,6 +162,7 @@ sleep(2);
 
 $results[] = $query ( $client, 'first' );
 $results[] = $query ( $client, 'one' );
+$results[] = $mquery ( $client );
 
 mysql_query ( 'update test_table set mode = 2 where id = 1000' );
 RunIndexer ( $errors, '--all --rotate' );
@@ -84,6 +170,8 @@ sleep(2);
 
 $results[] = $query ( $client, 'first' );
 $results[] = $query ( $client, 'one' );
+$results[] = $mquery ( $client );
+$results[] = $q1 ( $client, 'a*', 'expand' );
 
 ]]></custom_test>
 

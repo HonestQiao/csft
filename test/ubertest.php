@@ -7,6 +7,7 @@
 $sd_managed_searchd	= false;
 $sd_skip_indexer = false;
 $g_ignore_weights = false;
+$g_pick_query = -1;
 
 require_once ( "settings.inc" );
 
@@ -37,6 +38,8 @@ if ( !is_array($args) || empty($args) )
 	print ( "--no-drop-db\t\tKeep test db tables after the test (for debugging)\n");
 	print ( "--no-demo\t\tJust skip all tests without models. Else - run them, but never fail (for debugging)\n");
 	print ( "--no-marks\t\tDon't mark the output of every test in the logs.\n");
+	print ( "--ignore-weights\tIgnore differences in weights. (Useful for testing that reference database changes are ok.)\n" );
+	print ( "--cwd\t\t\tchange directory to ubertest.php location (for git bisect)\n" );
 	print ( "\nEnvironment variables are:\n" );
 	print ( "DBUSER\t\t\tuse 'USER' as MySQL user\n" );
 	print ( "DBPASS\t\t\tuse 'PASS' as MySQL password\n" );
@@ -84,10 +87,19 @@ for ( $i=0; $i<count($args); $i++ )
 	else if ( $arg=="--no-drop-db" )				$locals['no_drop_db'] = true;
 	else if ( $arg=="--no-demo" )					$g_skipdemo = true;
 	else if ( $arg=="--no-marks" )					$g_usemarks = false;
+	else if ( $arg=="--cwd" )						chdir ( DIRNAME ( __FILE__ ) );
 	else if ( is_dir($arg) )						$test_dirs[] = $arg;
 	else if ( preg_match ( "/^(\\d+)-(\\d+)$/", $arg, $range ) )
 	{
 		$test_range = array ( $range[1], $range[2] ); // from, to
+
+	} else if ( preg_match ( "/^(\\d+):(\\d+)$/", $arg, $range ) )
+	{
+		// FIXME! lockdown gen model, only keep test mode
+		// FIXME! lockdown $test_dirs from here, and check it for emptiness
+		// ie. make sure there are NO other test arguments when this syntax is in use
+		$test_dirs = array ( sprintf ( "test_%03d", $range[1] ) );
+		$g_pick_query = (int)$range[2];
 
 	} else if ( is_dir(sprintf("test_%03d", $arg)))
 	{
@@ -107,6 +119,9 @@ if ( !$run )
 
 PublishLocals ( $locals, false );
 GuessIdSize();
+GuessRE2();
+GuessRLP();
+GuessODBC();
 
 if ( $g_locals["malloc-scribble"] )
 {
@@ -260,6 +275,7 @@ while ( file_exists ( "config_$nfile.conf" ) )
 $nfile = 1;
 while ( file_exists ( "error_$nfile.txt" ) )
 {
+	// FIXME? not when there were actual errors?
 	@unlink ( "error_$nfile.txt" );
 	$nfile++;
 }

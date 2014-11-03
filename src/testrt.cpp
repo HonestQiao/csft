@@ -3,8 +3,8 @@
 //
 
 //
-// Copyright (c) 2001-2011, Andrew Aksyonoff
-// Copyright (c) 2008-2011, Sphinx Technologies Inc
+// Copyright (c) 2001-2014, Andrew Aksyonoff
+// Copyright (c) 2008-2014, Sphinx Technologies Inc
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -23,7 +23,7 @@
 #pragma message("Automatically linking with psapi.lib")
 #endif
 
-const int	COMMIT_STEP = 1;
+int			COMMIT_STEP = 1;
 float		g_fTotalMB = 0.0f;
 
 void SetupIndexing ( CSphSource_MySQL * pSrc, const CSphSourceParams_MySQL & tParams )
@@ -44,14 +44,18 @@ void DoSearch ( CSphIndex * pIndex )
 
 	CSphQuery tQuery;
 	CSphQueryResult tResult;
+	KillListVector dDummyKlist;
+	CSphMultiQueryArgs tArgs ( dDummyKlist, 1 );
 	tQuery.m_sQuery = "@title cat";
 
-	ISphMatchSorter * pSorter = sphCreateQueue ( &tQuery, pIndex->GetMatchSchema(), tResult.m_sError, false );
+	SphQueueSettings_t tQueueSettings ( tQuery, pIndex->GetMatchSchema(), tResult.m_sError, NULL );
+	tQueueSettings.m_bComputeItems = false;
+	ISphMatchSorter * pSorter = sphCreateQueue ( tQueueSettings );
 	if ( !pSorter )
 	{
 		printf ( "failed to create sorter; error=%s", tResult.m_sError.cstr() );
 
-	} else if ( !pIndex->MultiQuery ( &tQuery, &tResult, 1, &pSorter, NULL ) )
+	} else if ( !pIndex->MultiQuery ( &tQuery, &tResult, 1, &pSorter, tArgs ) )
 	{
 		printf ( "query failed; error=%s", pIndex->GetLastError().cstr() );
 
@@ -60,7 +64,7 @@ void DoSearch ( CSphIndex * pIndex )
 		sphFlattenQueue ( pSorter, &tResult, 0 );
 		printf ( "%d results found in %d.%03d sec!\n", tResult.m_dMatches.GetLength(), tResult.m_iQueryTime/1000, tResult.m_iQueryTime%1000 );
 		ARRAY_FOREACH ( i, tResult.m_dMatches )
-			printf ( "%d. id=" DOCID_FMT ", weight=%d\n", 1+i, tResult.m_dMatches[i].m_iDocID, tResult.m_dMatches[i].m_iWeight );
+			printf ( "%d. id=" DOCID_FMT ", weight=%d\n", 1+i, tResult.m_dMatches[i].m_uDocID, tResult.m_dMatches[i].m_iWeight );
 	}
 
 	SafeDelete ( pSorter );
@@ -70,7 +74,7 @@ void DoSearch ( CSphIndex * pIndex )
 
 void DoIndexing ( CSphSource * pSrc, ISphRtIndex * pIndex )
 {
-	CSphString sError;
+	CSphString sError, sWarning;
 	CSphVector<DWORD> dMvas;
 
 	int64_t tmStart = sphMicroTimer ();
@@ -81,14 +85,16 @@ void DoIndexing ( CSphSource * pSrc, ISphRtIndex * pIndex )
 	{
 		if ( !pSrc->IterateDocument ( sError ) )
 			sphDie ( "iterate-document failed: %s", sError.cstr() );
-		ISphHits * pHitsNext = pSrc->IterateHits ( sError );
-		if ( !sError.IsEmpty() )
-			sphDie ( "iterate-hits failed: %s", sError.cstr() );
 
-		if ( pSrc->m_tDocInfo.m_iDocID )
-			pIndex->AddDocument ( pHitsNext, pSrc->m_tDocInfo, NULL, dMvas, sError );
+		if ( pSrc->m_tDocInfo.m_uDocID )
+		{
+			ISphHits * pHitsNext = pSrc->IterateHits ( sError );
+			if ( !sError.IsEmpty() )
+				sphDie ( "iterate-hits failed: %s", sError.cstr() );
+			pIndex->AddDocument ( pHitsNext, pSrc->m_tDocInfo, NULL, dMvas, sError, sWarning );
+		}
 
-		if ( ( pSrc->GetStats().m_iTotalDocuments % COMMIT_STEP )==0 || !pSrc->m_tDocInfo.m_iDocID )
+		if ( ( pSrc->GetStats().m_iTotalDocuments % COMMIT_STEP )==0 || !pSrc->m_tDocInfo.m_uDocID )
 		{
 			int64_t tmCommit = sphMicroTimer();
 			pIndex->Commit ();
@@ -98,7 +104,7 @@ void DoIndexing ( CSphSource * pSrc, ISphRtIndex * pIndex )
 			tmAvgCommit += tmCommit;
 			tmMaxCommit = Max ( tmMaxCommit, tmCommit );
 
-			if ( !pSrc->m_tDocInfo.m_iDocID )
+			if ( !pSrc->m_tDocInfo.m_uDocID )
 			{
 				tmAvgCommit /= iCommits;
 				break;
@@ -170,18 +176,29 @@ void IndexingThread ( void * pArg )
 }
 
 
-int main ()
+int main ( int argc, char ** argv )
 {
+	if ( argc==2 )
+		COMMIT_STEP = atoi ( argv[1] );
+
+	// threads should be initialized before memory allocations
+	char cTopOfMainStack;
+	sphThreadInit();
+	MemorizeStack ( &cTopOfMainStack );
+
 	CSphString sError;
 	CSphDictSettings tDictSettings;
+	tDictSettings.m_bWordDict = false;
 
 	ISphTokenizer * pTok = sphCreateUTF8Tokenizer();
-	CSphDict * pDict = sphCreateDictionaryCRC ( tDictSettings, pTok, sError, "rt1" );
-	CSphSource * pSrc = SpawnSource ( "SELECT id, channel_id, UNIX_TIMESTAMP(published) published, title, UNCOMPRESS(content) content FROM posting WHERE id<=10000 AND id%2=0", pTok, pDict );
+	CSphDict * pDict = sphCreateDictionaryCRC ( tDictSettings, NULL, pTok, "rt1", sError );
+	CSphSource * pSrc = SpawnSource ( "SELECT id, channel_id, UNIX_TIMESTAMP(published) published, "
+		"title, UNCOMPRESS(content) content FROM posting WHERE id<=10000 AND id%2=0", pTok, pDict );
 
 	ISphTokenizer * pTok2 = sphCreateUTF8Tokenizer();
-	CSphDict * pDict2 = sphCreateDictionaryCRC ( tDictSettings, pTok, sError, "rt2" );
-	CSphSource * pSrc2 = SpawnSource ( "SELECT id, channel_id, UNIX_TIMESTAMP(published) published, title, UNCOMPRESS(content) content FROM posting WHERE id<=10000 AND id%2=1", pTok2, pDict2 );
+	CSphDict * pDict2 = sphCreateDictionaryCRC ( tDictSettings, NULL, pTok, "rt2", sError );
+	CSphSource * pSrc2 = SpawnSource ( "SELECT id, channel_id, UNIX_TIMESTAMP(published) published, "
+		"title, UNCOMPRESS(content) content FROM posting WHERE id<=10000 AND id%2=1", pTok2, pDict2 );
 
 	CSphSchema tSrcSchema;
 	if ( !pSrc->UpdateSchema ( &tSrcSchema, sError ) )
@@ -193,7 +210,7 @@ int main ()
 		tSchema.AddAttr ( tSrcSchema.GetAttr(i), false );
 
 	CSphConfigSection tRTConfig;
-	sphRTInit();
+	sphRTInit ( tRTConfig, true );
 	sphRTConfigure ( tRTConfig, true );
 	SmallStringHash_T< CSphIndex * > dTemp;
 	sphReplayBinlog ( dTemp, 0 );
@@ -215,7 +232,8 @@ int main ()
 
 #if 0
 	// update
-	tParams.m_sQuery = "SELECT id, channel_id, UNIX_TIMESTAMP(published) published, title, UNCOMPRESS(content) content FROM rt2 WHERE id<=10000";
+	tParams.m_sQuery = "SELECT id, channel_id, UNIX_TIMESTAMP(published) published, title, "
+		"UNCOMPRESS(content) content FROM rt2 WHERE id<=10000";
 	SetupIndexing ( pSrc, tParams );
 	DoIndexing ( pSrc, pIndex );
 #endif

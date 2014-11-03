@@ -24,6 +24,12 @@
 #   docs = posts.map(&:body)
 #   excerpts = sphinx.BuildExcerpts(docs, 'index', 'test')
 
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#							WARNING
+# We strongly recommend you to use SphinxQL instead of the API
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
 require 'socket'
 
 module Sphinx
@@ -61,7 +67,7 @@ module Sphinx
     # excerpt command version
     VER_COMMAND_EXCERPT  = 0x102
     # update command version
-    VER_COMMAND_UPDATE   = 0x102
+    VER_COMMAND_UPDATE   = 0x103
     # keywords command version
     VER_COMMAND_KEYWORDS = 0x100
     
@@ -107,6 +113,10 @@ module Sphinx
     SPH_RANK_WORDCOUNT      = 3
     # phrase proximity
     SPH_RANK_PROXIMITY      = 4
+    SPH_RANK_MATCHANY       = 5
+    SPH_RANK_FIELDMASK      = 6
+    SPH_RANK_SPH04          = 7
+    SPH_RANK_EXPR           = 8
     
     # Known sort modes
   
@@ -177,7 +187,7 @@ module Sphinx
       # per-query settings
       @offset        = 0                       # how many records to seek from result-set start (default is 0)
       @limit         = 20                      # how many records to return from result-set starting at offset (default is 20)
-      @mode          = SPH_MATCH_ALL           # query matching mode (default is SPH_MATCH_ALL)
+      @mode          = SPH_MATCH_EXTENDED2     # query matching mode (default is SPH_MATCH_EXTENDED2)
       @weights       = []                      # per-field weights (default is 1 for all fields)
       @sort          = SPH_SORT_RELEVANCE      # match sorting mode (default is SPH_SORT_RELEVANCE)
       @sortby        = ''                      # attribute to sort by (defualt is "")
@@ -195,6 +205,7 @@ module Sphinx
       @anchor        = []                      # geographical anchor point
       @indexweights  = []                      # per-index weights
       @ranker        = SPH_RANK_PROXIMITY_BM25 # ranking mode (default is SPH_RANK_PROXIMITY_BM25)
+      @rankexpr	     = ''                      # ranker expression for SPH_RANK_EXPR
       @maxquerytime  = 0                       # max query time, milliseconds (default is 0, do not limit) 
       @fieldweights  = {}                      # per-field-name weights
       @overrides     = []                      # per-query attribute values overrides
@@ -251,8 +262,9 @@ module Sphinx
       @maxquerytime = max
     end
     
-    # Set matching mode.
+    # Set matching mode. DEPRECATED
     def SetMatchMode(mode)
+      $stderr.puts "DEPRECATED: Do not call this method or, even better, use SphinxQL instead of an API\n"
       assert { mode == SPH_MATCH_ALL \
             || mode == SPH_MATCH_ANY \
             || mode == SPH_MATCH_PHRASE \
@@ -265,14 +277,19 @@ module Sphinx
     end
     
     # Set ranking mode.
-    def SetRankingMode(ranker)
+    def SetRankingMode(ranker, rankexpr = '')
       assert { ranker == SPH_RANK_PROXIMITY_BM25 \
             || ranker == SPH_RANK_BM25 \
             || ranker == SPH_RANK_NONE \
             || ranker == SPH_RANK_WORDCOUNT \
-            || ranker == SPH_RANK_PROXIMITY }
+            || ranker == SPH_RANK_PROXIMITY \
+            || ranker == SPH_RANK_MATCHANY \
+            || ranker == SPH_RANK_FIELDMASK \
+            || ranker == SPH_RANK_SPH04 \
+            || ranker == SPH_RANK_EXPR }
 
       @ranker = ranker
+      @rankexpr = rankexpr
     end
     
     # Set matches sorting mode.
@@ -470,11 +487,12 @@ module Sphinx
       @retrydelay = delay
     end
     
-    # Set attribute values override
+    # DEPRECATED: Set attribute values override
     #
 	  # There can be only one override per attribute.
 	  # +values+ must be a hash that maps document IDs to attribute values.
 	  def SetOverride(attrname, attrtype, values)
+      $stderr.puts "DEPRECATED: Do not call this method. Use SphinxQL REMAP() function instead.\n"
       assert { attrname.instance_of? String }
       assert { [SPH_ATTR_INTEGER, SPH_ATTR_TIMESTAMP, SPH_ATTR_BOOL, SPH_ATTR_FLOAT, SPH_ATTR_BIGINT].include?(attrtype) }
       assert { values.instance_of? Hash }
@@ -567,7 +585,14 @@ module Sphinx
   
       # mode and limits
       request = Request.new
-      request.put_int @offset, @limit, @mode, @ranker, @sort
+      request.put_int @offset, @limit, @mode, @ranker
+      # process the 'expr' ranker
+      if @ranker == SPH_RANK_EXPR
+        request.put_string @rankexpr
+      end
+
+      request.put_int @sort
+
       request.put_string @sortby
       # query itself
       request.put_string query
@@ -950,16 +975,18 @@ module Sphinx
     # * +values+ is a hash where key is document id, and value is an array of
     # * +mva+ identifies whether update MVA
     # new attribute values
+    # * +ignoreexistent+ identifies whether silently ignore updating of non-existent columns
     #
     # Returns number of actually updated documents (0 or more) on success.
     # Returns -1 on failure.
     #
     # Usage example:
     #    sphinx.UpdateAttributes('test1', ['group_id'], { 1 => [456] })
-    def UpdateAttributes(index, attrs, values, mva = false)
+    def UpdateAttributes(index, attrs, values, mva = false, ignoreexistent = false )
       # verify everything
       assert { index.instance_of? String }
       assert { mva.instance_of?(TrueClass) || mva.instance_of?(FalseClass) }
+      assert { ignoreexistent.instance_of?(TrueClass) || ignoreexistent.instance_of?(FalseClass) }
       
       assert { attrs.instance_of? Array }
       attrs.each do |attr|
@@ -986,6 +1013,7 @@ module Sphinx
       request.put_string index
       
       request.put_int attrs.length
+      request.put_int ignoreexistent ? 1 : 0
       for attr in attrs
         request.put_string attr
         request.put_int mva ? 1 : 0

@@ -3,8 +3,8 @@
 //
 
 //
-// Copyright (c) 2001-2011, Andrew Aksyonoff
-// Copyright (c) 2008-2011, Sphinx Technologies Inc
+// Copyright (c) 2001-2014, Andrew Aksyonoff
+// Copyright (c) 2008-2014, Sphinx Technologies Inc
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -19,10 +19,13 @@
 
 #if !USE_WINDOWS
 #include <sys/time.h> // for gettimeofday
+
+// define this if you want to run gprof over the threads model - to track children threads also.
+#define USE_GPROF 0
+
 #endif
 
-
-static int g_iThreadStackSize = 65536;
+int g_iThreadStackSize = 1024*1024;
 
 //////////////////////////////////////////////////////////////////////////
 
@@ -67,9 +70,13 @@ struct CSphMemHeader
 {
 	DWORD			m_uMagic;
 	const char *	m_sFile;
+#if SPH_DEBUG_BACKTRACES
+	const char *	m_sBacktrace;
+#endif
 	int				m_iLine;
 	size_t			m_iSize;
 	int				m_iAllocId;
+	BYTE *			m_pPointer;
 	CSphMemHeader *	m_pNext;
 	CSphMemHeader *	m_pPrev;
 };
@@ -83,6 +90,9 @@ static int64_t			g_iCurBytes		= 0;
 static int				g_iTotalAllocs	= 0;
 static int				g_iPeakAllocs	= 0;
 static int64_t			g_iPeakBytes	= 0;
+#if SPH_ALLOC_FILL
+static bool				g_bFirstRandomAlloc = true;
+#endif
 
 void * sphDebugNew ( size_t iSize, const char * sFile, int iLine, bool bArray )
 {
@@ -96,9 +106,31 @@ void * sphDebugNew ( size_t iSize, const char * sFile, int iLine, bool bArray )
 	CSphMemHeader * pHeader = (CSphMemHeader*) pBlock;
 	pHeader->m_uMagic = bArray ? MEMORY_MAGIC_ARRAY : MEMORY_MAGIC_PLAIN;
 	pHeader->m_sFile = sFile;
+#if SPH_ALLOC_FILL
+	if ( g_bFirstRandomAlloc )
+	{
+		sphAutoSrand();
+		g_bFirstRandomAlloc = false;
+	}
+
+	BYTE * pBlockPtr = (BYTE*)(pHeader+1);
+	for ( size_t i = 0; i < iSize; i++ )
+		*pBlockPtr++ = BYTE(sphRand () & 0xFF);
+#endif
+#if SPH_DEBUG_BACKTRACES
+	const char * sTrace = DoBacktrace ( 0, 3 );
+	if ( sTrace )
+	{
+		char * pTrace = (char*) ::malloc ( strlen(sTrace) + 1 );
+		strcpy ( pTrace, sTrace ); //NOLINT
+		pHeader->m_sBacktrace = pTrace;
+	} else
+		pHeader->m_sBacktrace = NULL;
+#endif
 	pHeader->m_iLine = iLine;
 	pHeader->m_iSize = iSize;
 	pHeader->m_iAllocId = ++g_iAllocsId;
+	pHeader->m_pPointer = pBlock;
 	pHeader->m_pNext = g_pAllocs;
 	pHeader->m_pPrev = NULL;
 	if ( g_pAllocs )
@@ -180,6 +212,11 @@ void sphDebugDelete ( void * pPtr, bool bArray )
 	g_iCurAllocs--;
 	g_iCurBytes -= pHeader->m_iSize;
 
+#if SPH_DEBUG_BACKTRACES
+	if ( pHeader->m_sBacktrace )
+		::free ( (void*) pHeader->m_sBacktrace );
+#endif
+
 #if SPH_DEBUG_DOFREE
 	::free ( pHeader );
 #endif
@@ -219,8 +256,12 @@ void sphAllocsDump ( int iFile, int iSinceID )
 		pHeader && pHeader->m_iAllocId > iSinceID;
 		pHeader = pHeader->m_pNext )
 	{
-		sphSafeInfo ( iFile, "alloc %d at %s(%d): %d bytes\n", pHeader->m_iAllocId,
-			pHeader->m_sFile, pHeader->m_iLine, (int)pHeader->m_iSize );
+		sphSafeInfo ( iFile, "alloc %d at %s(%d): 0x%0p %d bytes\n", pHeader->m_iAllocId,
+			pHeader->m_sFile, pHeader->m_iLine, pHeader->m_pPointer, (int)pHeader->m_iSize );
+
+#if SPH_DEBUG_BACKTRACES
+		sphSafeInfo ( iFile, "Backtrace:\n%s\n", pHeader->m_sBacktrace );
+#endif
 
 		iTotalBytes += pHeader->m_iSize;
 		iTotal++;
@@ -317,10 +358,10 @@ struct MemCategorized_t
 	}
 };
 
-static Memory::Category_e sphMemStatGet ();
+static MemCategory_e sphMemStatGet ();
 
 // memory categories storage
-static MemCategorized_t g_dMemCategoryStat[Memory::SPH_MEM_TOTAL];
+static MemCategorized_t g_dMemCategoryStat [ MEM_TOTAL ];
 
 //////////////////////////////////////////////////////////////////////////
 // ALLOCATIONS COUNT/SIZE PROFILER
@@ -333,7 +374,7 @@ void * sphDebugNew ( size_t iSize )
 		sphDie ( "out of memory (unable to allocate %"PRIu64" bytes)", (uint64_t)iSize ); // FIXME! this may fail with malloc error too
 
 	const int iMemType = sphMemStatGet();
-	assert ( iMemType>=0 && iMemType<Memory::SPH_MEM_TOTAL );
+	assert ( iMemType>=0 && iMemType<MEM_TOTAL );
 
 	g_tAllocsMutex.Lock ();
 
@@ -366,7 +407,7 @@ void sphDebugDelete ( void * pPtr )
 
 	const int iSize = pBlock[0];
 	const int iMemType = pBlock[1];
-	assert ( iMemType>=0 && iMemType<Memory::SPH_MEM_TOTAL );
+	assert ( iMemType>=0 && iMemType<MEM_TOTAL );
 
 	g_tAllocsMutex.Lock ();
 
@@ -403,17 +444,18 @@ void operator delete [] ( void * pPtr )						{ sphDebugDelete ( pPtr ); }
 
 //////////////////////////////////////////////////////////////////////////////
 // MEMORY STATISTICS
+//////////////////////////////////////////////////////////////////////////////
 
 /// TLS key of memory category stack
 SphThreadKey_t g_tTLSMemCategory;
 
-STATIC_ASSERT ( Memory::SPH_MEM_TOTAL<255, MEMORY_CATEGORY_EXCEED_LIMIT );
+STATIC_ASSERT ( MEM_TOTAL<255, TOO_MANY_MEMORY_CATEGORIES );
 
 // stack of memory categories as we move deeper and deeper
 class MemCategoryStack_t // NOLINT
 {
-#define MEM_STACK_MAX_DEPHT 1024
-	BYTE m_dStack[MEM_STACK_MAX_DEPHT];
+#define MEM_STACK_MAX 1024
+	BYTE m_dStack[MEM_STACK_MAX];
 	int m_iDepth;
 
 public:
@@ -422,22 +464,22 @@ public:
 	void Reset ()
 	{
 		m_iDepth = 0;
-		m_dStack[0] = Memory::SPH_MEM_CORE;
+		m_dStack[0] = MEM_CORE;
 	}
 
-	void Push ( Memory::Category_e eCategory )
+	void Push ( MemCategory_e eCategory )
 	{
-		assert ( eCategory>=0 && eCategory<Memory::SPH_MEM_TOTAL );
-		assert ( m_iDepth+1<MEM_STACK_MAX_DEPHT );
+		assert ( eCategory>=0 && eCategory<MEM_TOTAL );
+		assert ( m_iDepth+1<MEM_STACK_MAX );
 		m_dStack[++m_iDepth] = (BYTE)eCategory;
 	}
 
 #ifndef NDEBUG
-	void Pop ( Memory::Category_e eCategory )
+	void Pop ( MemCategory_e eCategory )
 	{
-		assert ( eCategory>=0 && eCategory<Memory::SPH_MEM_TOTAL );
+		assert ( eCategory>=0 && eCategory<MEM_TOTAL );
 #else
-	void Pop ( Memory::Category_e )
+	void Pop ( MemCategory_e )
 	{
 #endif
 
@@ -446,11 +488,11 @@ public:
 		m_iDepth--;
 	}
 
-	Memory::Category_e Top () const
+	MemCategory_e Top () const
 	{
-		assert ( m_iDepth>= 0 && m_iDepth<MEM_STACK_MAX_DEPHT );
-		assert ( m_dStack[m_iDepth]>=0 && m_dStack[m_iDepth]<Memory::SPH_MEM_TOTAL );
-		return Memory::Category_e ( m_dStack[m_iDepth] );
+		assert ( m_iDepth>= 0 && m_iDepth<MEM_STACK_MAX );
+		assert ( m_dStack[m_iDepth]>=0 && m_dStack[m_iDepth]<MEM_TOTAL );
+		return MemCategory_e ( m_dStack[m_iDepth] );
 	}
 };
 
@@ -503,8 +545,8 @@ void sphMemStatMMapAdd ( int64_t iSize )
 	g_iPeakAllocs = Max ( g_iCurAllocs, g_iPeakAllocs );
 	g_iPeakBytes = Max ( g_iCurBytes, g_iPeakBytes );
 
-	g_dMemCategoryStat[Memory::SPH_MEM_MMAPED].m_iSize += iSize;
-	g_dMemCategoryStat[Memory::SPH_MEM_MMAPED].m_iCount++;
+	g_dMemCategoryStat[MEM_MMAPED].m_iSize += iSize;
+	g_dMemCategoryStat[MEM_MMAPED].m_iCount++;
 
 	g_tAllocsMutex.Unlock ();
 }
@@ -516,14 +558,14 @@ void sphMemStatMMapDel ( int64_t iSize )
 	g_iCurAllocs--;
 	g_iCurBytes -= iSize;
 
-	g_dMemCategoryStat[Memory::SPH_MEM_MMAPED].m_iSize -= iSize;
-	g_dMemCategoryStat[Memory::SPH_MEM_MMAPED].m_iCount--;
+	g_dMemCategoryStat[MEM_MMAPED].m_iSize -= iSize;
+	g_dMemCategoryStat[MEM_MMAPED].m_iCount--;
 
 	g_tAllocsMutex.Unlock ();
 }
 
 // push new category on arrival
-void sphMemStatPush ( Memory::Category_e eCategory )
+void sphMemStatPush ( MemCategory_e eCategory )
 {
 	MemCategoryStack_t * pTLS = (MemCategoryStack_t*) sphThreadGet ( g_tTLSMemCategory );
 	if ( pTLS )
@@ -531,7 +573,7 @@ void sphMemStatPush ( Memory::Category_e eCategory )
 };
 
 // restore last category
-void sphMemStatPop ( Memory::Category_e eCategory )
+void sphMemStatPop ( MemCategory_e eCategory )
 {
 	MemCategoryStack_t * pTLS = (MemCategoryStack_t*) sphThreadGet ( g_tTLSMemCategory );
 	if ( pTLS )
@@ -539,30 +581,24 @@ void sphMemStatPop ( Memory::Category_e eCategory )
 };
 
 // get current category
-static Memory::Category_e sphMemStatGet ()
+static MemCategory_e sphMemStatGet ()
 {
 	MemCategoryStack_t * pTLS = (MemCategoryStack_t*) sphThreadGet ( g_tTLSMemCategory );
-	return pTLS ? pTLS->Top() : Memory::SPH_MEM_CORE;
+	return pTLS ? pTLS->Top() : MEM_CORE;
 }
 
-// human readable category names
-static const char* g_dMemCategoryName[] = {
-	"core"
-	, "index_disk", "index_rt", "index_rt_accum"
-	, "mmaped", "binlog"
-	, "hnd_disk", "hnd_sql"
-	, "search_disk", "query_disk", "insert_sql", "select_sql", "delete_sql", "commit_set_sql", "commit_start_t_sql", "commit_sql"
-	, "mquery_disk", "mqueryex_disk", "mquery_rt"
-	, "rt_res_matches", "rt_res_strings"
-	};
-STATIC_ASSERT ( sizeof(g_dMemCategoryName)/sizeof(g_dMemCategoryName[0])==Memory::SPH_MEM_TOTAL, MEM_STAT_NAME_MISMATCH );
 
-// output of memory statistic's
+// human readable category names
+#define MEM_CATEGORY(_arg) #_arg
+static const char* g_dMemCategoryName[] = { MEM_CATEGORIES };
+#undef MEM_CATEGORY
+
+
 void sphMemStatDump ( int iFD )
 {
 	int64_t iSize = 0;
 	int iCount = 0;
-	for ( int i=0; i<Memory::SPH_MEM_TOTAL; i++ )
+	for ( int i=0; i<MEM_TOTAL; i++ )
 	{
 		iSize += (int64_t) g_dMemCategoryStat[i].m_iSize;
 		iCount += g_dMemCategoryStat[i].m_iCount;
@@ -571,7 +607,7 @@ void sphMemStatDump ( int iFD )
 	sphSafeInfo ( iFD, "%-24s allocs-count=%d, mem-total=%d.%d Mb", "(total)", iCount,
 		(int)(iSize/1048576), (int)( (iSize*10/1048576)%10 ) );
 
-	for ( int i=0; i<Memory::SPH_MEM_TOTAL; i++ )
+	for ( int i=0; i<MEM_TOTAL; i++ )
 		if ( g_dMemCategoryStat[i].m_iCount>0 )
 	{
 		iSize = (int64_t) g_dMemCategoryStat[i].m_iSize;
@@ -586,12 +622,13 @@ void sphMemStatDump ( int iFD )
 //////////////////////////////////////////////////////////////////////////////
 
 #else
+#ifndef SPH_DONT_OVERRIDE_MEMROUTINES
 
 void * operator new ( size_t iSize )
 {
 	void * pResult = ::malloc ( iSize );
 	if ( !pResult )
-		sphDie ( "out of memory (unable to allocate "UINT64_FMT" bytes)", (uint64_t)iSize ); // FIXME! this may fail with malloc error too
+		sphDieRestart ( "out of memory (unable to allocate "UINT64_FMT" bytes)", (uint64_t)iSize ); // FIXME! this may fail with malloc error too
 	return pResult;
 }
 
@@ -600,23 +637,32 @@ void * operator new [] ( size_t iSize )
 {
 	void * pResult = ::malloc ( iSize );
 	if ( !pResult )
-		sphDie ( "out of memory (unable to allocate "UINT64_FMT" bytes)", (uint64_t)iSize ); // FIXME! this may fail with malloc error too
+		sphDieRestart ( "out of memory (unable to allocate "UINT64_FMT" bytes)", (uint64_t)iSize ); // FIXME! this may fail with malloc error too
 	return pResult;
 }
 
+#if USE_RE2
+void operator delete ( void * pPtr ) throw ()
+#else
 void operator delete ( void * pPtr )
+#endif
 {
 	if ( pPtr )
 		::free ( pPtr );
 }
 
 
+#if USE_RE2
+void operator delete [] ( void * pPtr ) throw ()
+#else
 void operator delete [] ( void * pPtr )
+#endif
 {
 	if ( pPtr )
 		::free ( pPtr );
 }
 
+#endif // SPH_DONT_OVERRIDE_MEMROUTINES
 #endif // SPH_ALLOCS_PROFILER
 #endif // SPH_DEBUG_LEAKS
 
@@ -643,7 +689,7 @@ void sphSetDieCallback ( SphDieCallback_t pfDieCallback )
 
 void sphDie ( const char * sTemplate, ... )
 {
-	char sBuf[256];
+	char sBuf[1024];
 
 	va_list ap;
 	va_start ( ap, sTemplate );
@@ -657,6 +703,25 @@ void sphDie ( const char * sTemplate, ... )
 		fprintf ( stdout, "FATAL: %s\n", sBuf );
 
 	exit ( 1 );
+}
+
+
+void sphDieRestart ( const char * sTemplate, ... )
+{
+	char sBuf[1024];
+
+	va_list ap;
+	va_start ( ap, sTemplate );
+	vsnprintf ( sBuf, sizeof(sBuf), sTemplate, ap );
+	va_end ( ap );
+
+	// if there's no callback,
+	// or if callback returns true,
+	// log to stdout
+	if ( !g_pfDieCallback || g_pfDieCallback ( sBuf ) )
+		fprintf ( stdout, "FATAL: %s\n", sBuf );
+
+	exit ( 2 ); // almost CRASH_EXIT
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -735,6 +800,24 @@ CSphProcessSharedMutex::CSphProcessSharedMutex ( int iExtraSize )
 {
 	m_pMutex = NULL;
 
+#ifdef __FreeBSD__
+	CSphString sError, sWarning;
+	if ( !m_pStorage.Alloc ( sizeof(sem_t) + iExtraSize, sError, sWarning ) )
+	{
+		m_sError.SetSprintf ( "storage.alloc, error='%s', warning='%s'", sError.cstr(), sWarning.cstr() );
+		return;
+	}
+
+	m_pMutex = (sem_t*) m_pStorage.GetWritePtr ();
+	int iRes = sem_init ( m_pMutex, 1, 1 );
+	if ( iRes )
+	{
+		m_sError.SetSprintf ( "sem_init, errno=%d ", iRes );
+		m_pMutex = NULL;
+		m_pStorage.Reset ();
+		return;
+	}
+#else
 	pthread_mutexattr_t tAttr;
 	int iRes = pthread_mutexattr_init ( &tAttr );
 	if ( iRes )
@@ -746,6 +829,7 @@ CSphProcessSharedMutex::CSphProcessSharedMutex ( int iExtraSize )
 	if ( iRes )
 	{
 		m_sError.SetSprintf ( "pthread_mutexattr_setpshared, errno = %d", iRes );
+		pthread_mutexattr_destroy ( &tAttr );
 		return;
 	}
 
@@ -753,51 +837,112 @@ CSphProcessSharedMutex::CSphProcessSharedMutex ( int iExtraSize )
 	if ( !m_pStorage.Alloc ( sizeof(pthread_mutex_t) + iExtraSize, sError, sWarning ) )
 	{
 		m_sError.SetSprintf ( "storage.alloc, error='%s', warning='%s'", sError.cstr(), sWarning.cstr() );
+		pthread_mutexattr_destroy ( &tAttr );
 		return;
 	}
 
 	m_pMutex = (pthread_mutex_t*) m_pStorage.GetWritePtr ();
 	iRes = pthread_mutex_init ( m_pMutex, &tAttr );
+
 	if ( iRes )
 	{
 		m_sError.SetSprintf ( "pthread_mutex_init, errno=%d ", iRes );
+		pthread_mutexattr_destroy ( &tAttr );
 		m_pMutex = NULL;
 		m_pStorage.Reset ();
 		return;
 	}
+
+	iRes = pthread_mutexattr_destroy ( &tAttr );
+	if ( iRes )
+	{
+		m_sError.SetSprintf ( "pthread_mutexattr_destroy, errno = %d", iRes );
+		return;
+	}
+#endif // __FreeBSD__
+}
+
+CSphProcessSharedMutex::~CSphProcessSharedMutex()
+{
+	if ( m_pMutex )
+	{
+#ifdef __FreeBSD__
+		sem_destroy ( m_pMutex );
+#else
+		pthread_mutex_destroy ( m_pMutex );
+#endif
+		m_pMutex = NULL;
+	}
 }
 #else
 CSphProcessSharedMutex::CSphProcessSharedMutex ( int )
-{}
+{
+	m_tLock.Init();
+}
+
+CSphProcessSharedMutex::~CSphProcessSharedMutex()
+{
+	m_tLock.Done();
+}
 #endif
 
 
-void CSphProcessSharedMutex::Lock () const
+void CSphProcessSharedMutex::Lock ()
 {
 #if !USE_WINDOWS
+#ifdef __FreeBSD__
+	if ( m_pMutex )
+		sem_wait ( m_pMutex );
+#else
 	if ( m_pMutex )
 		pthread_mutex_lock ( m_pMutex );
 #endif
-}
-
-
-void CSphProcessSharedMutex::Unlock () const
-{
-#if !USE_WINDOWS
-	if ( m_pMutex )
-		pthread_mutex_unlock ( m_pMutex );
+#else
+	m_tLock.Lock();
 #endif
 }
 
 
-bool CSphProcessSharedMutex::TimedLock ( int tmSpin ) const
+void CSphProcessSharedMutex::Unlock ()
 {
+#if !USE_WINDOWS
+#ifdef __FreeBSD__
+	if ( m_pMutex )
+		sem_post ( m_pMutex );
+#else
+	if ( m_pMutex )
+		pthread_mutex_unlock ( m_pMutex );
+#endif
+#else
+	m_tLock.Unlock();
+#endif
+}
+
+
 #if USE_WINDOWS
+bool CSphProcessSharedMutex::TimedLock ( int ) const
+	{
 	return false;
 #else
+bool CSphProcessSharedMutex::TimedLock ( int tmSpin ) const
+{
 	if ( !m_pMutex )
 		return false;
 
+#ifdef __FreeBSD__
+	struct timespec tp;
+	clock_gettime ( CLOCK_REALTIME, &tp );
+
+	tp.tv_nsec += tmSpin * 1000;
+	if ( tp.tv_nsec > 1000000 )
+	{
+		int iDelta = (int)( tp.tv_nsec / 1000000 );
+		tp.tv_sec += iDelta * 1000000;
+		tp.tv_nsec -= iDelta * 1000000;
+	}
+
+	return ( sem_timedwait ( m_pMutex, &tp )==0 );
+#else
 #if defined(HAVE_PTHREAD_MUTEX_TIMEDLOCK) && defined(HAVE_CLOCK_GETTIME)
 	struct timespec tp;
 	clock_gettime ( CLOCK_REALTIME, &tp );
@@ -824,9 +969,24 @@ bool CSphProcessSharedMutex::TimedLock ( int tmSpin ) const
 	if ( iRes==EBUSY )
 		iRes = pthread_mutex_trylock ( m_pMutex );
 
-	return iRes!=0;
+	return iRes==0;
 #endif // HAVE_PTHREAD_MUTEX_TIMEDLOCK && HAVE_CLOCK_GETTIME
+#endif // __FreeBSD__
 #endif // USE_WINDOWS
+}
+
+
+BYTE * CSphProcessSharedMutex::GetSharedData() const
+{
+#if !USE_WINDOWS
+#ifdef __FreeBSD__
+	return m_pStorage.GetWritePtr () + sizeof ( sem_t );
+#else
+	return m_pStorage.GetWritePtr () + sizeof ( pthread_mutex_t );
+#endif
+#else
+	return NULL;
+#endif
 }
 
 
@@ -844,14 +1004,26 @@ const char * CSphProcessSharedMutex::GetError() const
 // THREADING FUNCTIONS
 //////////////////////////////////////////////////////////////////////////
 
+// This is a working context for a thread wrapper. It wraps every thread to
+// store information about it's stack size, cleanup threads and something else.
+// This struct always should be allocated in the heap, cause wrapper need
+// to see it all the time and it frees it out of the heap by itself. Wrapper thread function
+// receives as an argument a pointer to ThreadCall_t with one function pointer to
+// a main thread function. Afterwards, thread can set up one or more cleanup functions
+// which will be executed by a wrapper in the linked list order after it dies.
 struct ThreadCall_t
 {
 	void			( *m_pCall )( void * pArg );
 	void *			m_pArg;
+#if USE_GPROF
+	pthread_mutex_t	m_dlock;
+	pthread_cond_t	m_dwait;
+	itimerval		m_ditimer;
+#endif
 	ThreadCall_t *	m_pNext;
 };
-SphThreadKey_t g_tThreadCleanupKey;
-SphThreadKey_t g_tMyThreadStack;
+static SphThreadKey_t g_tThreadCleanupKey;
+static SphThreadKey_t g_tMyThreadStack;
 
 
 #if USE_WINDOWS
@@ -862,7 +1034,12 @@ SphThreadKey_t g_tMyThreadStack;
 
 SPH_THDFUNC sphThreadProcWrapper ( void * pArg )
 {
-	// this is the first local variable in the new thread. So, it's address is the top of the stack.
+	// This is the first local variable in the new thread. So, its address is the top of the stack.
+	// We need to know thread stack size for both expression and query evaluating engines.
+	// We store expressions as a linked tree of structs and execution is a calls of mutually
+	// recursive methods. Before executing we compute tree height and multiply it by a constant
+	// with experimentally measured value to check whether we have enough stack to execute current query.
+	// The check is not ideal and do not work for all compilers and compiler settings.
 	char	cTopOfMyStack;
 	assert ( sphThreadGet ( g_tThreadCleanupKey )==NULL );
 	assert ( sphThreadGet ( g_tMyThreadStack )==NULL );
@@ -870,6 +1047,17 @@ SPH_THDFUNC sphThreadProcWrapper ( void * pArg )
 #if SPH_ALLOCS_PROFILER
 	MemCategoryStack_t * pTLS = sphMemStatThdInit();
 #endif
+
+#if USE_GPROF
+	// Set the profile timer value
+	setitimer ( ITIMER_PROF, &( (ThreadCall_t*) pArg )->m_ditimer, NULL );
+
+	// Tell the calling thread that we don't need its data anymore
+	pthread_mutex_lock ( &( (ThreadCall_t*) pArg)->m_dlock );
+	pthread_cond_signal ( &( (ThreadCall_t*) pArg)->m_dwait );
+	pthread_mutex_unlock ( &( (ThreadCall_t*) pArg)->m_dlock );
+#endif
+
 	ThreadCall_t * pCall = (ThreadCall_t*) pArg;
 	MemorizeStack ( & cTopOfMyStack );
 	pCall->m_pCall ( pCall->m_pArg );
@@ -929,10 +1117,10 @@ void * sphThreadInit ( bool )
 		bInit = true;
 	}
 #if !USE_WINDOWS
-	if ( pthread_attr_setstacksize ( &tJoinableAttr, sphMyStackSize() ) )
+	if ( pthread_attr_setstacksize ( &tJoinableAttr, g_iThreadStackSize + PTHREAD_STACK_MIN ) )
 		sphDie ( "FATAL: pthread_attr_setstacksize( joinable ) failed" );
 
-	if ( pthread_attr_setstacksize ( &tDetachedAttr, sphMyStackSize() ) )
+	if ( pthread_attr_setstacksize ( &tDetachedAttr, g_iThreadStackSize + PTHREAD_STACK_MIN ) )
 		sphDie ( "FATAL: pthread_attr_setstacksize( detached ) failed" );
 
 	return bDetached ? &tDetachedAttr : &tJoinableAttr;
@@ -957,8 +1145,8 @@ void sphThreadDone ( int )
 
 bool sphThreadCreate ( SphThread_t * pThread, void (*fnThread)(void*), void * pArg, bool bDetached )
 {
-	// we can not merely put this on current stack
-	// as it might get destroyed before wrapper sees it
+	// we can not put this on current stack because wrapper need to see
+	// it all the time and it will destroy this data from heap by itself
 	ThreadCall_t * pCall = new ThreadCall_t;
 	pCall->m_pCall = fnThread;
 	pCall->m_pArg = pArg;
@@ -967,14 +1155,33 @@ bool sphThreadCreate ( SphThread_t * pThread, void (*fnThread)(void*), void * pA
 	// create thread
 #if USE_WINDOWS
 	sphThreadInit ( bDetached );
-	*pThread = CreateThread ( NULL, sphMyStackSize(), sphThreadProcWrapper, pCall, 0, NULL );
+	*pThread = CreateThread ( NULL, g_iThreadStackSize, sphThreadProcWrapper, pCall, 0, NULL );
 	if ( *pThread )
 		return true;
 #else
+
+#if USE_GPROF
+	getitimer ( ITIMER_PROF, &pCall->m_ditimer );
+	pthread_cond_init ( &pCall->m_dwait, NULL );
+	pthread_mutex_init ( &pCall->m_dlock, NULL );
+	pthread_mutex_lock ( &pCall->m_dlock );
+#endif
+
 	void * pAttr = sphThreadInit ( bDetached );
 	errno = pthread_create ( pThread, (pthread_attr_t*) pAttr, sphThreadProcWrapper, pCall );
+
+#if USE_GPROF
+	if ( !errno )
+		pthread_cond_wait ( &pCall->m_dwait, &pCall->m_dlock );
+
+	pthread_mutex_unlock ( &pCall->m_dlock );
+	pthread_mutex_destroy ( &pCall->m_dlock );
+	pthread_cond_destroy ( &pCall->m_dwait );
+#endif
+
 	if ( !errno )
 		return true;
+
 #endif
 
 	// thread creation failed so we need to cleanup ourselves
@@ -995,7 +1202,10 @@ bool sphThreadJoin ( SphThread_t * pThread )
 #endif
 }
 
-
+// Adds a function call (a new task for a wrapper) to a linked list
+// of thread contexts. They will be executed one by one right after
+// the main thread ends its execution. This is a way for a wrapper
+// to free local resources allocated by its main thread.
 void sphThreadOnExit ( void (*fnCleanup)(void*), void * pArg )
 {
 	ThreadCall_t * pCleanup = new ThreadCall_t;
@@ -1041,13 +1251,15 @@ void * sphMyStack ()
 	return sphThreadGet ( g_tMyThreadStack );
 }
 
-int sphMyStackSize ()
+
+int64_t sphGetStackUsed()
 {
-#if USE_WINDOWS
-	return g_iThreadStackSize;
-#else
-	return PTHREAD_STACK_MIN + g_iThreadStackSize;
-#endif
+	BYTE cStack;
+	BYTE * pStackTop = (BYTE*)sphMyStack();
+	if ( !pStackTop )
+		return 0;
+	int64_t iHeight = pStackTop - &cStack;
+	return ( iHeight>=0 ) ? iHeight : -iHeight;
 }
 
 void sphSetMyStackSize ( int iStackSize )
@@ -1089,7 +1301,7 @@ bool sphIsLtLib()
 #endif
 
 //////////////////////////////////////////////////////////////////////////
-// MUTEX
+// MUTEX and EVENT
 //////////////////////////////////////////////////////////////////////////
 
 #if USE_WINDOWS
@@ -1098,6 +1310,7 @@ bool sphIsLtLib()
 
 bool CSphMutex::Init ()
 {
+	assert ( !m_bInitialized );
 	m_hMutex = CreateMutex ( NULL, FALSE, NULL );
 	m_bInitialized = ( m_hMutex!=NULL );
 	return m_bInitialized;
@@ -1114,13 +1327,49 @@ bool CSphMutex::Done ()
 
 bool CSphMutex::Lock ()
 {
+	assert ( m_bInitialized );
 	DWORD uWait = WaitForSingleObject ( m_hMutex, INFINITE );
 	return ( uWait!=WAIT_FAILED && uWait!=WAIT_TIMEOUT );
 }
 
 bool CSphMutex::Unlock ()
 {
+	assert ( m_bInitialized );
 	return ReleaseMutex ( m_hMutex )==TRUE;
+}
+
+bool CSphAutoEvent::Init ( CSphMutex * )
+{
+	m_bSent = false;
+	m_hEvent = CreateEvent ( NULL, FALSE, FALSE, NULL );
+	m_bInitialized = ( m_hEvent!=0 );
+		return m_bInitialized;
+}
+
+bool CSphAutoEvent::Done()
+{
+	if ( !m_bInitialized )
+		return true;
+
+	m_bInitialized = false;
+	return CloseHandle ( m_hEvent )==TRUE;
+}
+
+void CSphAutoEvent::SetEvent()
+{
+	::SetEvent ( m_hEvent );
+	m_bSent = true;
+}
+
+bool CSphAutoEvent::WaitEvent()
+{
+	if ( m_bSent )
+	{
+		m_bSent = false;
+		return true;
+	}
+	DWORD uWait = WaitForSingleObject ( m_hEvent, INFINITE );
+	return !( uWait==WAIT_FAILED || uWait==WAIT_TIMEOUT );
 }
 
 #else
@@ -1129,6 +1378,7 @@ bool CSphMutex::Unlock ()
 
 bool CSphMutex::Init ()
 {
+	assert ( !m_bInitialized );
 	m_bInitialized = ( pthread_mutex_init ( &m_tMutex, NULL )==0 );
 	return m_bInitialized;
 }
@@ -1144,12 +1394,55 @@ bool CSphMutex::Done ()
 
 bool CSphMutex::Lock ()
 {
+	assert ( m_bInitialized );
 	return ( pthread_mutex_lock ( &m_tMutex )==0 );
 }
 
 bool CSphMutex::Unlock ()
 {
+	assert ( m_bInitialized );
 	return ( pthread_mutex_unlock ( &m_tMutex )==0 );
+}
+
+bool CSphAutoEvent::Init ( CSphMutex * pMutex )
+{
+	m_bSent = false;
+	assert ( pMutex );
+	if ( !pMutex )
+		return false;
+	m_pMutex = pMutex->GetInternalMutex();
+	m_bInitialized = ( pthread_cond_init ( &m_tCond, NULL )==0 );
+	return m_bInitialized;
+}
+
+bool CSphAutoEvent::Done ()
+{
+	if ( !m_bInitialized )
+		return true;
+
+	m_bInitialized = false;
+	return ( pthread_cond_destroy ( &m_tCond ) )==0;
+}
+
+void CSphAutoEvent::SetEvent ()
+{
+	if ( !m_bInitialized )
+		return;
+
+	pthread_cond_signal ( &m_tCond ); // locking is done from outside
+	m_bSent = true;
+}
+
+bool CSphAutoEvent::WaitEvent ()
+{
+	if ( !m_bInitialized )
+		return true;
+	pthread_mutex_lock ( m_pMutex );
+	if ( !m_bSent )
+		pthread_cond_wait ( &m_tCond, m_pMutex );
+	m_bSent = false;
+	pthread_mutex_unlock ( m_pMutex );
+	return true;
 }
 
 #endif
@@ -1163,14 +1456,16 @@ bool CSphMutex::Unlock ()
 // Windows rwlock implementation
 
 CSphRwlock::CSphRwlock ()
-	: m_hWriteMutex ( NULL )
+	: m_bInitialized ( false )
+	, m_hWriteMutex ( NULL )
 	, m_hReadEvent ( NULL )
 	, m_iReaders ( 0 )
 {}
 
 
-bool CSphRwlock::Init ()
+bool CSphRwlock::Init ( bool )
 {
+	assert ( !m_bInitialized );
 	assert ( !m_hWriteMutex && !m_hReadEvent && !m_iReaders );
 
 	m_hReadEvent = CreateEvent ( NULL, TRUE, FALSE, NULL );
@@ -1184,12 +1479,16 @@ bool CSphRwlock::Init ()
 		m_hReadEvent = NULL;
 		return false;
 	}
+	m_bInitialized = true;
 	return true;
 }
 
 
 bool CSphRwlock::Done ()
 {
+	if ( !m_bInitialized )
+		return true;
+
 	if ( !CloseHandle ( m_hReadEvent ) )
 		return false;
 	m_hReadEvent = NULL;
@@ -1199,12 +1498,21 @@ bool CSphRwlock::Done ()
 	m_hWriteMutex = NULL;
 
 	m_iReaders = 0;
+	m_bInitialized = false;
 	return true;
+}
+
+
+const char * CSphRwlock::GetError () const
+{
+	return m_sError.cstr();
 }
 
 
 bool CSphRwlock::ReadLock ()
 {
+	assert ( m_bInitialized );
+
 	DWORD uWait = WaitForSingleObject ( m_hWriteMutex, INFINITE );
 	if ( uWait==WAIT_FAILED || uWait==WAIT_TIMEOUT )
 		return false;
@@ -1225,6 +1533,8 @@ bool CSphRwlock::ReadLock ()
 
 bool CSphRwlock::WriteLock ()
 {
+	assert ( m_bInitialized );
+
 	// try to acquire writer mutex
 	DWORD uWait = WaitForSingleObject ( m_hWriteMutex, INFINITE );
 	if ( uWait==WAIT_FAILED || uWait==WAIT_TIMEOUT )
@@ -1248,6 +1558,8 @@ bool CSphRwlock::WriteLock ()
 
 bool CSphRwlock::Unlock ()
 {
+	assert ( m_bInitialized );
+
 	// are we unlocking a writer?
 	if ( ReleaseMutex ( m_hWriteMutex ) )
 		return true; // yes we are
@@ -1272,34 +1584,296 @@ bool CSphRwlock::Unlock ()
 // UNIX rwlock implementation (pthreads wrapper)
 
 CSphRwlock::CSphRwlock ()
+	: m_bInitialized ( false )
 {}
 
-bool CSphRwlock::Init ()
+bool CSphRwlock::Init ( bool bProcessShared )
 {
-	return pthread_rwlock_init ( &m_tLock, NULL )==0;
+	assert ( !m_bInitialized );
+
+#ifdef __FreeBSD__
+	if ( bProcessShared )
+	{
+		m_sError = "process shared rwlock is not supported by FreeBSD";
+		return false;
+	}
+#endif
+
+	pthread_rwlockattr_t tAttr;
+	pthread_rwlockattr_t * pAttrUsed = NULL;
+	int iRes;
+
+	if ( bProcessShared )
+	{
+		iRes = pthread_rwlockattr_init ( &tAttr );
+		if ( iRes )
+		{
+			m_sError.SetSprintf ( "pthread_rwlockattr_init, errno=%d", iRes );
+			return false;
+		}
+		iRes = pthread_rwlockattr_setpshared ( &tAttr, PTHREAD_PROCESS_SHARED );
+		if ( iRes )
+		{
+			m_sError.SetSprintf ( "pthread_rwlockattr_setpshared, errno = %d", iRes );
+			pthread_rwlockattr_destroy ( &tAttr );
+			return false;
+		}
+
+		pAttrUsed = &tAttr;
+	}
+
+	iRes = pthread_rwlock_init ( &m_tLock, pAttrUsed );
+	if ( iRes )
+	{
+		m_sError.SetSprintf ( "pthread_rwlock_init, errno = %d", iRes );
+		if ( pAttrUsed )
+			pthread_rwlockattr_destroy ( pAttrUsed );
+		return false;
+	}
+
+	if ( pAttrUsed )
+	{
+		iRes = pthread_rwlockattr_destroy ( pAttrUsed );
+		if ( iRes )
+		{
+			m_sError.SetSprintf ( "pthread_rwlockattr_destroy, errno = %d", iRes );
+			return false;
+		}
+	}
+
+	m_bInitialized = true;
+
+	return true;
 }
 
 bool CSphRwlock::Done ()
 {
-	return pthread_rwlock_destroy ( &m_tLock )==0;
+	if ( !m_bInitialized )
+		return true;
+
+	m_bInitialized = !( pthread_rwlock_destroy ( &m_tLock )==0 );
+	return !m_bInitialized;
+}
+
+const char * CSphRwlock::GetError () const
+{
+	return m_sError.cstr();
 }
 
 bool CSphRwlock::ReadLock ()
 {
+	assert ( m_bInitialized );
+
 	return pthread_rwlock_rdlock ( &m_tLock )==0;
 }
 
 bool CSphRwlock::WriteLock ()
 {
+	assert ( m_bInitialized );
+
 	return pthread_rwlock_wrlock ( &m_tLock )==0;
 }
 
 bool CSphRwlock::Unlock ()
 {
+	assert ( m_bInitialized );
+
 	return pthread_rwlock_unlock ( &m_tLock )==0;
 }
 
 #endif
+
+//////////////////////////////////////////////////////////////////////////
+
+/// microsecond precision timestamp
+int64_t sphMicroTimer()
+{
+#if USE_WINDOWS
+	// Windows time query
+	static int64_t iBase = 0;
+	static int64_t iStart = 0;
+	static int64_t iFreq = 0;
+
+	LARGE_INTEGER iLarge;
+	if ( !iBase )
+	{
+		// get start QPC value
+		QueryPerformanceFrequency ( &iLarge ); iFreq = iLarge.QuadPart;
+		QueryPerformanceCounter ( &iLarge ); iStart = iLarge.QuadPart;
+
+		// get start UTC timestamp
+		// assuming it's still approximately the same moment as iStart, give or take a msec or three
+		FILETIME ft;
+		GetSystemTimeAsFileTime ( &ft );
+
+		iBase = ( int64_t(ft.dwHighDateTime)<<32 ) + int64_t(ft.dwLowDateTime);
+		iBase = ( iBase - 116444736000000000ULL ) / 10; // rebase from 01 Jan 1601 to 01 Jan 1970, and rescale to 1 usec from 100 ns
+	}
+
+	// we can't easily drag iBase into parens because iBase*iFreq/1000000 overflows 64bit int!
+	QueryPerformanceCounter ( &iLarge );
+	return iBase + ( iLarge.QuadPart - iStart )*1000000/iFreq;
+
+#else
+	// UNIX time query
+	struct timeval tv;
+	gettimeofday ( &tv, NULL );
+	return int64_t(tv.tv_sec)*int64_t(1000000) + int64_t(tv.tv_usec);
+#endif // USE_WINDOWS
+}
+
+//////////////////////////////////////////////////////////////////////////
+
+int CSphStrHashFunc::Hash ( const CSphString & sKey )
+{
+	return sKey.IsEmpty() ? 0 : sphCRC32 ( sKey.cstr() );
+}
+
+//////////////////////////////////////////////////////////////////////////
+
+DWORD g_dSphinxCRC32 [ 256 ] =
+{
+	0x00000000, 0x77073096, 0xee0e612c, 0x990951ba,
+	0x076dc419, 0x706af48f, 0xe963a535, 0x9e6495a3,
+	0x0edb8832, 0x79dcb8a4, 0xe0d5e91e, 0x97d2d988,
+	0x09b64c2b, 0x7eb17cbd, 0xe7b82d07, 0x90bf1d91,
+	0x1db71064, 0x6ab020f2, 0xf3b97148, 0x84be41de,
+	0x1adad47d, 0x6ddde4eb, 0xf4d4b551, 0x83d385c7,
+	0x136c9856, 0x646ba8c0, 0xfd62f97a, 0x8a65c9ec,
+	0x14015c4f, 0x63066cd9, 0xfa0f3d63, 0x8d080df5,
+	0x3b6e20c8, 0x4c69105e, 0xd56041e4, 0xa2677172,
+	0x3c03e4d1, 0x4b04d447, 0xd20d85fd, 0xa50ab56b,
+	0x35b5a8fa, 0x42b2986c, 0xdbbbc9d6, 0xacbcf940,
+	0x32d86ce3, 0x45df5c75, 0xdcd60dcf, 0xabd13d59,
+	0x26d930ac, 0x51de003a, 0xc8d75180, 0xbfd06116,
+	0x21b4f4b5, 0x56b3c423, 0xcfba9599, 0xb8bda50f,
+	0x2802b89e, 0x5f058808, 0xc60cd9b2, 0xb10be924,
+	0x2f6f7c87, 0x58684c11, 0xc1611dab, 0xb6662d3d,
+	0x76dc4190, 0x01db7106, 0x98d220bc, 0xefd5102a,
+	0x71b18589, 0x06b6b51f, 0x9fbfe4a5, 0xe8b8d433,
+	0x7807c9a2, 0x0f00f934, 0x9609a88e, 0xe10e9818,
+	0x7f6a0dbb, 0x086d3d2d, 0x91646c97, 0xe6635c01,
+	0x6b6b51f4, 0x1c6c6162, 0x856530d8, 0xf262004e,
+	0x6c0695ed, 0x1b01a57b, 0x8208f4c1, 0xf50fc457,
+	0x65b0d9c6, 0x12b7e950, 0x8bbeb8ea, 0xfcb9887c,
+	0x62dd1ddf, 0x15da2d49, 0x8cd37cf3, 0xfbd44c65,
+	0x4db26158, 0x3ab551ce, 0xa3bc0074, 0xd4bb30e2,
+	0x4adfa541, 0x3dd895d7, 0xa4d1c46d, 0xd3d6f4fb,
+	0x4369e96a, 0x346ed9fc, 0xad678846, 0xda60b8d0,
+	0x44042d73, 0x33031de5, 0xaa0a4c5f, 0xdd0d7cc9,
+	0x5005713c, 0x270241aa, 0xbe0b1010, 0xc90c2086,
+	0x5768b525, 0x206f85b3, 0xb966d409, 0xce61e49f,
+	0x5edef90e, 0x29d9c998, 0xb0d09822, 0xc7d7a8b4,
+	0x59b33d17, 0x2eb40d81, 0xb7bd5c3b, 0xc0ba6cad,
+	0xedb88320, 0x9abfb3b6, 0x03b6e20c, 0x74b1d29a,
+	0xead54739, 0x9dd277af, 0x04db2615, 0x73dc1683,
+	0xe3630b12, 0x94643b84, 0x0d6d6a3e, 0x7a6a5aa8,
+	0xe40ecf0b, 0x9309ff9d, 0x0a00ae27, 0x7d079eb1,
+	0xf00f9344, 0x8708a3d2, 0x1e01f268, 0x6906c2fe,
+	0xf762575d, 0x806567cb, 0x196c3671, 0x6e6b06e7,
+	0xfed41b76, 0x89d32be0, 0x10da7a5a, 0x67dd4acc,
+	0xf9b9df6f, 0x8ebeeff9, 0x17b7be43, 0x60b08ed5,
+	0xd6d6a3e8, 0xa1d1937e, 0x38d8c2c4, 0x4fdff252,
+	0xd1bb67f1, 0xa6bc5767, 0x3fb506dd, 0x48b2364b,
+	0xd80d2bda, 0xaf0a1b4c, 0x36034af6, 0x41047a60,
+	0xdf60efc3, 0xa867df55, 0x316e8eef, 0x4669be79,
+	0xcb61b38c, 0xbc66831a, 0x256fd2a0, 0x5268e236,
+	0xcc0c7795, 0xbb0b4703, 0x220216b9, 0x5505262f,
+	0xc5ba3bbe, 0xb2bd0b28, 0x2bb45a92, 0x5cb36a04,
+	0xc2d7ffa7, 0xb5d0cf31, 0x2cd99e8b, 0x5bdeae1d,
+	0x9b64c2b0, 0xec63f226, 0x756aa39c, 0x026d930a,
+	0x9c0906a9, 0xeb0e363f, 0x72076785, 0x05005713,
+	0x95bf4a82, 0xe2b87a14, 0x7bb12bae, 0x0cb61b38,
+	0x92d28e9b, 0xe5d5be0d, 0x7cdcefb7, 0x0bdbdf21,
+	0x86d3d2d4, 0xf1d4e242, 0x68ddb3f8, 0x1fda836e,
+	0x81be16cd, 0xf6b9265b, 0x6fb077e1, 0x18b74777,
+	0x88085ae6, 0xff0f6a70, 0x66063bca, 0x11010b5c,
+	0x8f659eff, 0xf862ae69, 0x616bffd3, 0x166ccf45,
+	0xa00ae278, 0xd70dd2ee, 0x4e048354, 0x3903b3c2,
+	0xa7672661, 0xd06016f7, 0x4969474d, 0x3e6e77db,
+	0xaed16a4a, 0xd9d65adc, 0x40df0b66, 0x37d83bf0,
+	0xa9bcae53, 0xdebb9ec5, 0x47b2cf7f, 0x30b5ffe9,
+	0xbdbdf21c, 0xcabac28a, 0x53b39330, 0x24b4a3a6,
+	0xbad03605, 0xcdd70693, 0x54de5729, 0x23d967bf,
+	0xb3667a2e, 0xc4614ab8, 0x5d681b02, 0x2a6f2b94,
+	0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d,
+};
+
+
+DWORD sphCRC32 ( const void * s )
+{
+	// calc CRC
+	DWORD crc = ~((DWORD)0);
+	for ( const BYTE * p=(const BYTE*)s; *p; p++ )
+		crc = (crc >> 8) ^ g_dSphinxCRC32 [ (crc ^ (*p)) & 0xff ];
+	return ~crc;
+}
+
+DWORD sphCRC32 ( const void * s, int iLen )
+{
+	// calc CRC
+	DWORD crc = ~((DWORD)0);
+	const BYTE * p = (const BYTE*)s;
+	const BYTE * pMax = p + iLen;
+	while ( p<pMax )
+		crc = (crc >> 8) ^ g_dSphinxCRC32 [ (crc ^ *p++) & 0xff ];
+	return ~crc;
+}
+
+DWORD sphCRC32 ( const void * s, int iLen, DWORD uPrevCRC )
+{
+	// calc CRC
+	DWORD crc = ~((DWORD)uPrevCRC);
+	const BYTE * p = (const BYTE*)s;
+	const BYTE * pMax = p + iLen;
+	while ( p<pMax )
+		crc = (crc >> 8) ^ g_dSphinxCRC32 [ (crc ^ *p++) & 0xff ];
+	return ~crc;
+}
+
+#if USE_WINDOWS
+template<>
+CSphAtomic<long>::operator long()
+{
+	return InterlockedExchangeAdd ( &m_iValue, 0 );
+}
+template<>
+long CSphAtomic<long>::Inc()
+{
+	return InterlockedIncrement ( &m_iValue )-1;
+}
+template<>
+long CSphAtomic<long>::Dec()
+{
+	return InterlockedDecrement ( &m_iValue )+1;
+}
+#endif
+
+// fast check if we are built with right endianess settings
+const char*		sphCheckEndian()
+{
+	const char* sErrorMsg = "Oops! It seems that sphinx was built with wrong endianess (cross-compiling?)\n"
+#if USE_LITTLE_ENDIAN
+		"either reconfigure and rebuild, defining ac_cv_c_bigendian=yes in the environment of ./configure script,\n"
+		"either ensure that '#define USE_LITTLE_ENDIAN = 0' in config/config.h\n";
+#else
+		"either reconfigure and rebuild, defining ac_cv_c_bigendian=no in the environment of ./configure script,\n"
+		"either ensure that '#define USE_LITTLE_ENDIAN = 1' in config/config.h\n";
+#endif
+
+	char sMagic[] = "\x01\x02\x03\x04\x05\x06\x07\x08";
+	unsigned long *pMagic;
+	unsigned long uResult;
+	pMagic = (unsigned long*)sMagic;
+	uResult = 0xFFFFFFFF & (*pMagic);
+#if USE_LITTLE_ENDIAN
+	if ( uResult==0x01020304 || uResult==0x05060708 )
+#else
+	if ( uResult==0x08070605 || uResult==0x04030201 )
+#endif
+		return sErrorMsg;
+	return NULL;
+}
 
 //
 // $Id$

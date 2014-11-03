@@ -3,8 +3,8 @@
 //
 
 //
-// Copyright (c) 2001-2011, Andrew Aksyonoff
-// Copyright (c) 2008-2011, Sphinx Technologies Inc
+// Copyright (c) 2001-2014, Andrew Aksyonoff
+// Copyright (c) 2008-2014, Sphinx Technologies Inc
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -22,7 +22,7 @@
 #include <ctype.h>
 #include <stdarg.h>
 
-/////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////
 
 /// my own isalpha (let's build our own theme park!)
 inline int sphIsAlpha ( int c )
@@ -38,37 +38,39 @@ inline bool sphIsSpace ( int iCode )
 }
 
 
-/// string splitter, extracts sequences of alphas (as in sphIsAlpha)
-inline void sphSplit ( CSphVector<CSphString> & dOut, const char * sIn )
+/// check for keyword modifiers
+inline bool sphIsModifier ( int iSymbol )
 {
-	if ( !sIn )
-		return;
-
-	const char * p = (char*)sIn;
-	while ( *p )
-	{
-		// skip non-alphas
-		while ( (*p) && !sphIsAlpha(*p) )
-			p++;
-		if ( !(*p) )
-			break;
-
-		// this is my next token
-		assert ( sphIsAlpha(*p) );
-		const char * sNext = p;
-		while ( sphIsAlpha(*p) )
-			p++;
-		if ( sNext!=p )
-			dOut.Add().SetBinary ( sNext, p-sNext );
-	}
-
+	return iSymbol=='^' || iSymbol=='$' || iSymbol=='=' || iSymbol=='*';
 }
 
+
+/// all wildcards
+inline bool sphIsWild ( char c )
+{
+	return c=='*' || c=='?' || c=='%';
+}
+
+
+/// string splitter, extracts sequences of alphas (as in sphIsAlpha)
+void sphSplit ( CSphVector<CSphString> & dOut, const char * sIn );
+
+/// string splitter, splits by the given boundaries
+void sphSplit ( CSphVector<CSphString> & dOut, const char * sIn, const char * sBounds );
+
+/// string wildcard matching (case-sensitive, supports * and ? patterns)
+bool sphWildcardMatch ( const char * sSstring, const char * sPattern );
+
+//////////////////////////////////////////////////////////////////////////
 
 /// config section (hash of variant values)
 class CSphConfigSection : public SmallStringHash_T < CSphVariant >
 {
 public:
+	CSphConfigSection ()
+		: m_iTag ( 0 )
+	{}
+
 	/// get integer option value by key and default value
 	int GetInt ( const char * sKey, int iDefault=0 ) const
 	{
@@ -87,11 +89,14 @@ public:
 	const char * GetStr ( const char * sKey, const char * sDefault="" ) const
 	{
 		CSphVariant * pEntry = (*this)( sKey );
-		return pEntry ? pEntry->cstr() : sDefault;
+		return pEntry ? pEntry->strval().cstr() : sDefault;
 	}
 
 	/// get size option (plain int, or with K/M prefix) value by key and default value
-	int GetSize ( const char * sKey, int iDefault ) const;
+	int		GetSize ( const char * sKey, int iDefault ) const;
+	int64_t GetSize64 ( const char * sKey, int64_t iDefault ) const;
+
+	int m_iTag;
 };
 
 /// config section type (hash of sections)
@@ -131,16 +136,20 @@ protected:
 	bool			ValidateKey ( const char * sKey );
 
 #if !USE_WINDOWS
-	bool			TryToExec ( char * pBuffer, char * pEnd, const char * szFilename, CSphVector<char> & dResult );
+	bool			TryToExec ( char * pBuffer, const char * szFilename, CSphVector<char> & dResult );
 #endif
 	char *			GetBufferString ( char * szDest, int iMax, const char * & szSource );
 };
+
+#if !USE_WINDOWS
+bool TryToExec ( char * pBuffer, const char * szFilename, CSphVector<char> & dResult, char * sError, int iErrorLen );
+#endif
 
 /////////////////////////////////////////////////////////////////////////////
 
 enum
 {
-	TOKENIZER_SBCS		= 1,
+	// where was TOKENIZER_SBCS=1 once
 	TOKENIZER_UTF8		= 2,
 	TOKENIZER_NGRAM	= 3
 };
@@ -149,16 +158,21 @@ enum
 const char *	sphLoadConfig ( const char * sOptConfig, bool bQuiet, CSphConfigParser & cp );
 
 /// configure tokenizer from index definition section
-bool			sphConfTokenizer ( const CSphConfigSection & hIndex, CSphTokenizerSettings & tSettings, CSphString & sError );
+void			sphConfTokenizer ( const CSphConfigSection & hIndex, CSphTokenizerSettings & tSettings );
 
 /// configure dictionary from index definition section
 void			sphConfDictionary ( const CSphConfigSection & hIndex, CSphDictSettings & tSettings );
+
+/// configure field filter from index definition section
+bool			sphConfFieldFilter ( const CSphConfigSection & hIndex, CSphFieldFilterSettings & tSettings, CSphString & sError );
 
 /// configure index from index definition section
 bool			sphConfIndex ( const CSphConfigSection & hIndex, CSphIndexSettings & tSettings, CSphString & sError );
 
 /// try to set dictionary, tokenizer and misc settings for an index (if not already set)
-bool			sphFixupIndexSettings ( CSphIndex * pIndex, const CSphConfigSection & hIndex, CSphString & sError );
+bool			sphFixupIndexSettings ( CSphIndex * pIndex, const CSphConfigSection & hIndex, CSphString & sError, bool bTemplateDict=false );
+
+bool			sphInitCharsetAliasTable ( CSphString & sError );
 
 enum ESphLogLevel
 {
@@ -172,12 +186,12 @@ enum ESphLogLevel
 
 typedef void ( *SphLogger_fn )( ESphLogLevel, const char *, va_list );
 
-void sphWarning ( const char * sFmt, ... ) __attribute__((format(printf,1,2)));
-void sphInfo ( const char * sFmt, ... ) __attribute__((format(printf,1,2)));
-void sphLogFatal ( const char * sFmt, ... ) __attribute__((format(printf,1,2)));
-void sphLogDebug ( const char * sFmt, ... ) __attribute__((format(printf,1,2)));
-void sphLogDebugv ( const char * sFmt, ... ) __attribute__((format(printf,1,2)));
-void sphLogDebugvv ( const char * sFmt, ... ) __attribute__((format(printf,1,2)));
+void sphWarning ( const char * sFmt, ... ) __attribute__((format(printf,1,2))); //NOLINT
+void sphInfo ( const char * sFmt, ... ) __attribute__((format(printf,1,2))); //NOLINT
+void sphLogFatal ( const char * sFmt, ... ) __attribute__((format(printf,1,2))); //NOLINT
+void sphLogDebug ( const char * sFmt, ... ) __attribute__((format(printf,1,2))); //NOLINT
+void sphLogDebugv ( const char * sFmt, ... ) __attribute__((format(printf,1,2))); //NOLINT
+void sphLogDebugvv ( const char * sFmt, ... ) __attribute__((format(printf,1,2))); //NOLINT
 void sphSetLogger ( SphLogger_fn fnLog );
 
 //////////////////////////////////////////////////////////////////////////
@@ -189,7 +203,7 @@ void sphSetLogger ( SphLogger_fn fnLog );
 		#define CRASH_EXIT { signal ( sig, SIG_DFL ); kill ( getpid(), sig ); }
 	#else
 		// UNIX release build, just die
-		#define CRASH_EXIT exit ( 2 )
+		#define CRASH_EXIT { exit ( 2 ); }
 	#endif
 #else
 	#ifndef NDEBUG
@@ -215,6 +229,50 @@ void sphBacktrace ( int iFD, bool bSafe=false );
 /// Windows minidump gets saved to a file
 void sphBacktrace ( EXCEPTION_POINTERS * pExc, const char * sFile );
 #endif
+
+void sphBacktraceSetBinaryName ( const char * sName );
+
+/// plain backtrace - returns static buffer with the text of the call stack
+const char * DoBacktrace ( int iDepth=0, int iSkip=0 );
+
+void sphCheckDuplicatePaths ( const CSphConfig & hConf );
+
+/// set globals from the common config section
+void sphConfigureCommon ( const CSphConfig & hConf );
+
+/// my own is chinese
+bool sphIsChineseCode ( int iCode );
+
+/// detect chinese chars in a buffer
+bool sphDetectChinese ( const BYTE * szBuffer, int iLength );
+
+/// returns ranker name as string
+const char * sphGetRankerName ( ESphRankMode eRanker );
+
+class CSphDynamicLibrary : public ISphNoncopyable
+{
+	bool		m_bReady; // whether the lib is valid or not
+	void *		m_pLibrary; // internal handle
+
+public:
+	CSphDynamicLibrary()
+		: m_bReady ( false )
+		, m_pLibrary ( NULL )
+		, m_sError ( "" )
+		{}
+	virtual ~CSphDynamicLibrary()
+	{}
+
+	bool		Init ( const char* sPath, bool bGlobal=true );
+	bool		LoadSymbol ( const char* sName, void** ppFunc );
+	bool		LoadSymbols ( const char** sNames, void*** pppFuncs, int iNum );
+
+public:
+	CSphString	m_sError;
+
+private:
+	void		FillError ( const char* sMessage=NULL );
+};
 
 #endif // _sphinxutils_
 

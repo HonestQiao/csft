@@ -3,8 +3,8 @@
 //
 
 //
-// Copyright (c) 2001-2011, Andrew Aksyonoff
-// Copyright (c) 2008-2011, Sphinx Technologies Inc
+// Copyright (c) 2001-2014, Andrew Aksyonoff
+// Copyright (c) 2008-2014, Sphinx Technologies Inc
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -17,59 +17,10 @@
 #include <string.h>
 
 /////////////////////////////////////////////////////////////////////////////
-// SBCS windows-1251 implementation
-/////////////////////////////////////////////////////////////////////////////
-
-struct RussianAlphabetWin1251_t
-{
-	enum
-	{
-		A	= 0xE0,
-		B	= 0xE1,
-		V	= 0xE2,
-		G	= 0xE3,
-		D	= 0xE4,
-		E	= 0xE5,
-		YO	= 0xB8,
-		ZH	= 0xE6,
-		Z	= 0xE7,
-		I	= 0xE8,
-		IY	= 0xE9,
-		K	= 0xEA,
-		L	= 0xEB,
-		M	= 0xEC,
-		N	= 0xED,
-		O	= 0xEE,
-		P	= 0xEF,
-		R	= 0xF0,
-		S	= 0xF1,
-		T	= 0xF2,
-		U	= 0xF3,
-		F	= 0xF4,
-		H	= 0xF5,
-		TS	= 0xF6,
-		CH	= 0xF7,
-		SH	= 0xF8,
-		SCH	= 0xF9,
-		TVY	= 0xFA, // TVYordiy znak
-		Y	= 0xFB,
-		MYA	= 0xFC, // MYAgkiy znak
-		EE	= 0xFD,
-		YU	= 0xFE,
-		YA	= 0xFF
-	};
-};
-
-#define LOC_CHAR_TYPE		unsigned char
-#define LOC_PREFIX(_a)		_a##_cp1251
-#define RUS					RussianAlphabetWin1251_t
-
-#include "sphinxstemru.inl"
-
-/////////////////////////////////////////////////////////////////////////////
 // UTF-8 implementation
 /////////////////////////////////////////////////////////////////////////////
 
+#if USE_LITTLE_ENDIAN
 struct RussianAlphabetUTF8_t
 {
 	enum
@@ -109,6 +60,47 @@ struct RussianAlphabetUTF8_t
 		YA	= 0x8FD1U
 	};
 };
+#else
+struct RussianAlphabetUTF8_t
+{
+	enum
+	{
+		A	= 0xD0B0U,
+		B	= 0xD0B1U,
+		V	= 0xD0B2U,
+		G	= 0xD0B3U,
+		D	= 0xD0B4U,
+		E	= 0xD0B5U,
+		YO	= 0xD191U,
+		ZH	= 0xD0B6U,
+		Z	= 0xD0B7U,
+		I	= 0xD0B8U,
+		IY	= 0xD0B9U,
+		K	= 0xD0BAU,
+		L	= 0xD0BBU,
+		M	= 0xD0BCU,
+		N	= 0xD0BDU,
+		O	= 0xD0BEU,
+		P	= 0xD0BFU,
+		R	= 0xD180U,
+		S	= 0xD181U,
+		T	= 0xD182U,
+		U	= 0xD183U,
+		F	= 0xD184U,
+		H	= 0xD185U,
+		TS	= 0xD186U,
+		CH	= 0xD187U,
+		SH	= 0xD188U,
+		SCH	= 0xD189U,
+		TVY	= 0xD18AU, // TVYordiy znak
+		Y	= 0xD18BU,
+		MYA	= 0xD18CU, // MYAgkiy znak
+		EE	= 0xD18DU,
+		YU	= 0xD18EU,
+		YA	= 0xD18FU
+	};
+};
+#endif
 
 #define LOC_CHAR_TYPE		unsigned short
 #define LOC_PREFIX(_a)		_a##_utf8
@@ -120,7 +112,6 @@ struct RussianAlphabetUTF8_t
 
 void stem_ru_init ()
 {
-	stem_ru_init_cp1251 ();
 	stem_ru_init_utf8 ();
 }
 

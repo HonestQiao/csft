@@ -55,12 +55,14 @@ do
 
 		if test [ $? -eq 0 ]
 		then
+			MYSQL_PKGLIBDIR=`echo $MYSQL_LIBS | sed -e 's/-[[^L]][[^ ]]*//g;s/\s*-L//g;'`
 			AC_MSG_RESULT([$mysqlconfig])
 			mysqlconfig=
 			break
 		else
 			MYSQL_CFLAGS=
 			MYSQL_LIBS=
+			MYSQL_PKGLIBDIR=
 		fi
 	fi
 done
@@ -101,6 +103,7 @@ then
 		if test [ -n "$CANDIDATE" -a -d "$CANDIDATE" ]
 		then
 			MYSQL_LIBS="-L$CANDIDATE -lmysqlclient -lz"
+			MYSQL_PKGLIBDIR="$CANDIDATE"
 			break
 		fi
 	done
@@ -127,6 +130,7 @@ then
 	ac_cv_mysql_libs=`echo ${ac_cv_mysql_libs} | sed -e 's/.libs$//' \
 		-e 's+.libs/$++'`
 	MYSQL_LIBS="-L$ac_cv_mysql_libs -lmysqlclient -lz"
+	MYSQL_PKGLIBDIR="$ac_cv_mysql_libs"
 fi
 
 # if we got options from mysqlconfig try to actually use them
@@ -158,6 +162,7 @@ then
 			# clear flags, the code below will complain
 			MYSQL_CFLAGS=
 			MYSQL_LIBS=
+			MYSQL_PKGLIBDIR=
 		])
 	])
 	CFLAGS=$_CFLAGS
@@ -252,7 +257,8 @@ fi
 if test [ -n "$ac_cv_pgsql_libs" ]
 then
 	AC_CACHE_CHECK([PostgreSQL libraries], [ac_cv_pgsql_libs], [ac_cv_pgsql_libs=""])
-	PGSQL_LIBS="-L$ac_cv_pgsql_libs -lpq"
+	PGSQL_PKGLIBDIR="$ac_cv_pgsql_libs"
+	PGSQL_LIBS="-L$PGSQL_PKGLIBDIR -lpq"
 fi
 
 # If some path is missing, try to autodetermine with pgsql_config
@@ -283,11 +289,193 @@ ERROR: cannot find PostgreSQL libraries. If you want to compile with PosgregSQL 
         if test [ -z "$ac_cv_pgsql_libs" ]
         then
             AC_MSG_CHECKING(PostgreSQL linker flags)
-            PGSQL_LIBS="-L`${pgconfig} --libdir` -lpq"
+			PGSQL_PKGLIBDIR=`${pgconfig} --libdir`
+            PGSQL_LIBS="-L$PGSQL_PKGLIBDIR -lpq"
             AC_MSG_RESULT($PGSQL_LIBS)
         fi
     fi
 fi
+])
+
+dnl ---------------------------------------------------------------------------
+dnl Macro: AC_CHECK_LIBSTEMMER
+dnl Check the libstemmer first in custom include path in --with-libstemmer=*
+dnl If not given, try to guess common shared libs, and finally fall back into
+dnl old sphinx way which invokes statically linked lib built from the sources
+dnl ---------------------------------------------------------------------------
+
+AC_DEFUN([AC_CHECK_LIBSTEMMER],[
+
+# cflags and libs
+LIBSTEMMER_CFLAGS=
+LIBSTEMMER_LIBS=
+
+# First check, if we have the sources of internal libstemmer.
+# If so, it has the max. priority over any other possibilities
+if test -d ./libstemmer_c && test -f libstemmer_c/include/libstemmer.h; then
+	ac_cv_use_internal_libstemmer=yes
+    LIBSTEMMER_LIBS="\$(top_srcdir)/libstemmer_c/libstemmer.a"
+    LIBSTEMMER_CFLAGS="-I\$(top_srcdir)/libstemmer_c/include"
+else
+
+# possible includedir paths
+includedirs="/usr/include /usr/include/libstemmer /usr/include/libstemmer_c"
+
+# possible libdirs -- 64bit first in case of multiarch environments
+libdirs="/usr/lib/x86_64-linux-gnu /usr/lib64 /usr/local/lib64 /usr/lib/i386-linux-gnu /usr/lib /usr/local/lib"
+
+# possible libnames -- shared one first, then static one
+libnames="stemmer stemmer_c"
+
+# was (include) path explicitely given?
+if test [ -n "$ac_cv_use_libstemmer" -a x$ac_cv_use_libstemmer != xyes]; then
+       includedirs=$ac_cv_use_libstemmer
+fi
+
+
+# try to find header files
+for includedir in $includedirs
+do
+       if test [ -f $includedir/libstemmer.h ]; then
+               LIBSTEMMER_CFLAGS="-I$includedir"
+               break
+       fi
+done
+
+# try to find shared library
+for libname in $libnames
+do
+       for libdir in $libdirs
+       do
+               if test [ -f $libdir/lib${libname}.so ]; then
+                       LIBSTEMMER_LIBS="-L$libdir -l$libname"
+                       break 2
+               fi
+       done
+done
+
+# if not found, check static libs
+if test [ -z "$LIBSTEMMER_LIBS" ]; then
+       for libname in $libnames
+       do
+               for libdir in $libdirs
+               do
+                       if test [ -f $libdir/lib${libname}.a ]; then
+                               LIBSTEMMER_LIBS="$libdir/lib${libname}.a"
+                               break 2
+                       fi
+               done
+       done
+fi
+fi
+
+# Now we either have libstemmer, or not
+if test [ -z "$LIBSTEMMER_LIBS" ]; then
+	AC_MSG_ERROR([missing libstemmer sources from libstemmer_c.
+
+Please download the C version of libstemmer library from
+http://snowball.tartarus.org/ and extract its sources over libstemmer_c/
+subdirectory in order to build Sphinx with libstemmer support. Or
+install the package named like 'libstemmer-dev' using your favorite
+package manager.
+])
+fi
+
+])
+
+dnl ---------------------------------------------------------------------------
+dnl Macro: AC_CHECK_RE2
+dnl Check user-specified path in --with-re2=*, then check ./libre2 path.
+dnl Finally check for installed libraries and headers if present.
+dnl Also libraries and headers paths can be given using --with-re2-libs and
+dnl --with-re2-includes
+dnl ---------------------------------------------------------------------------
+
+AC_DEFUN([AC_CHECK_RE2],[
+
+# Includes and libraries
+LIBRE2_CFLAGS=
+LIBRE2_LIBS=
+
+# First check if include path was explicitly given.
+# If so, it has the maximum priority over any other possibilities
+
+if test [ -n "$ac_cv_use_re2" -a x$ac_cv_use_re2 != xyes]; then
+       re2include=$ac_cv_use_re2
+       if test [ -f $re2include/re2/re2.h ]; then
+               LIBRE2_CFLAGS="-I$re2include"
+               LIBRE2_LIBS="$re2include/obj/libre2.a"
+
+# Use re2 Makefile if present
+               if test [ -f $re2include/Makefile ]; then
+                       LIBRE2_PATH="$re2include"
+               fi
+       fi
+else
+
+# Check if there any sources in ./libre2 path
+       if test -d ./libre2 && test -f ./libre2/re2/re2.h; then
+               ac_cv_use_re2=yes
+               LIBRE2_LIBS="\$(top_srcdir)/libre2/obj/libre2.a"
+               LIBRE2_CFLAGS="-I\$(top_srcdir)/libre2"
+               LIBRE2_PATH="libre2"
+       else
+
+# Possible include paths
+       re2includedirs="/usr/include /usr/include/re2"
+
+# Possible libraries paths
+       re2libdirs="/usr/lib/x86_64-linux-gnu /usr/lib64 /usr/local/lib64 /usr/lib/i386-linux-gnu /usr/lib /usr/local/lib"
+
+
+# Trying to find installed header files
+       for re2includedir in $re2includedirs
+       do
+               if test [ -f $re2includedir/re2/re2.h ]; then
+                       LIBRE2_CFLAGS="-I$re2includedir"
+                       break
+               fi
+       done
+
+# Trying to find installed libraries
+       for re2libdir in $re2libdirs
+       do
+               if test [ -f $re2libdir/libre2.a ]; then
+                       LIBRE2_LIBS="$re2libdir/libre2.a"
+                       break 2
+               fi
+       done
+
+fi
+fi
+
+# Apply explicit include path overrides
+
+if test x$ac_cv_re2_includes != xno; then
+       if test [ -f $ac_cv_re2_includes/re2/re2.h ]; then
+               LIBRE2_CFLAGS="-I$ac_cv_re2_includes"
+       else
+               AC_MSG_ERROR([missing re2 headers])
+       fi
+fi
+
+
+# Apply explicit lib path overrides
+
+if test x$ac_cv_re2_libs != xno; then
+       if test  [ -f "$ac_cv_re2_libs" ]; then
+               LIBRE2_LIBS="$ac_cv_re2_libs"
+       else
+               AC_MSG_ERROR([missing re2 library libre2.a])
+       fi
+fi
+
+
+# Now we either have re2, or not
+if test [ -z "$LIBRE2_LIBS" ]; then
+        AC_MSG_ERROR([missing re2 sources])
+fi
+
 ])
 
 dnl ---------------------------------------------------------------------------

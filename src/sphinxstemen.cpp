@@ -3,8 +3,8 @@
 //
 
 //
-// Copyright (c) 2001-2011, Andrew Aksyonoff
-// Copyright (c) 2008-2011, Sphinx Technologies Inc
+// Copyright (c) 2001-2014, Andrew Aksyonoff
+// Copyright (c) 2008-2014, Sphinx Technologies Inc
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -230,7 +230,7 @@ void stem_en ( unsigned char * word, int len )
 #define SUFF7A(c7,c6,c5,c4,c3,c2) ( len>=6 && W(2,c2) && W(3,c3) && W(4,c4) && W(5,c5) && W(6,c6) && W(7,c7) )
 
 	///////////
-	// STEP 1A 
+	// STEP 1A
 	///////////
 
 #ifdef SNOWBALL2011

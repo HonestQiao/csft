@@ -3,8 +3,8 @@
 //
 
 //
-// Copyright (c) 2001-2011, Andrew Aksyonoff
-// Copyright (c) 2008-2011, Sphinx Technologies Inc
+// Copyright (c) 2001-2014, Andrew Aksyonoff
+// Copyright (c) 2008-2014, Sphinx Technologies Inc
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -32,602 +32,6 @@ static const int MAX_HIGHLIGHT_WORDS = 256;
 #define UINT16_MASK 0xffff
 typedef uint64_t ZonePacked_t;
 
-class ExcerptGen_c
-{
-	friend class SnippetsQwordSetup;
-
-public:
-	explicit				ExcerptGen_c ( bool bUtf8 );
-							~ExcerptGen_c () {}
-
-	char *	BuildExcerpt ( const ExcerptQuery_t & tQuery );
-
-	void	TokenizeQuery ( const ExcerptQuery_t &, CSphDict * pDict, ISphTokenizer * pTokenizer, const CSphIndexSettings & tSettings );
-	void	TokenizeDocument ( char * pData, int iDataLen, CSphDict * pDict, ISphTokenizer * pTokenizer, bool bFillMasks, const ExcerptQuery_t & q, const CSphIndexSettings & tSettings );
-
-	void	SetMarker ( CSphHitMarker * pMarker ) { m_pMarker = pMarker; }
-	void	SetExactPhrase ( const ExcerptQuery_t & tQuery );
-
-public:
-	enum Token_e
-	{
-		TOK_NONE = 0,		///< unspecified type, also used as the end marker
-		TOK_WORD,			///< just a word
-		TOK_SPACE,			///< whitespace chars seq
-		TOK_BREAK,			///< non-word chars seq which delimit a phrase part or boundary
-		TOK_SPZ				///< SENTENCE, PARAGRAPH, ZONE
-	};
-
-	struct Token_t
-	{
-		Token_e				m_eType;		///< token type
-		int					m_iStart;		///< token start (index in codepoints array)
-		int					m_iLengthCP;	///< token length (in codepoints)
-		int					m_iLengthBytes;	///< token length (in bytes)
-		int					m_iWeight;		///< token weight
-		DWORD				m_uWords;		///< matching query words mask
-		SphWordID_t			m_iWordID;		///< token word ID from dictionary
-		SphWordID_t			m_iBlendID;		///< blended word ID (eg. "T-mobile" would not tokenize itself, but still shadow "T" and "mobile")
-		DWORD				m_uPosition;	///< hit position in document
-
-		void Reset ()
-		{
-			m_eType = TOK_NONE;
-			m_iStart = 0;
-			m_iLengthCP = 0;
-			m_iLengthBytes = 0;
-			m_iWeight = 0;
-			m_uWords = 0;
-			m_iWordID = 0;
-			m_iBlendID = 0;
-			m_uPosition = 0;
-		}
-	};
-
-	struct TokenSpan_t
-	{
-		int		m_iStart;	///< start index, inclusive
-		int		m_iEnd;		///< end index, inclusive
-		int		m_iWords;	///< number of TOK_WORDS tokens
-		int		m_iQwords;	///< number of words matching query
-
-		void Reset ()
-		{
-			m_iStart = -1;
-			m_iEnd = -2;
-			m_iWords = 0;
-			m_iQwords = 0;
-		}
-
-		void Add ( int i, bool bQword )
-		{
-			assert ( m_iStart<i && m_iEnd<i );
-			if ( m_iStart<0 )
-				m_iStart = i;
-			m_iEnd = i;
-			m_iWords++;
-			m_iQwords += bQword;
-		}
-	};
-
-	struct Passage_t
-	{
-		int					m_iStart;			///< start token index
-		int					m_iTokens;			///< token count
-		int					m_iCodes;			///< codepoints count
-		int					m_iWords;			///< words count
-		DWORD				m_uQwords;			///< matching query words mask
-		int					m_iQwordsWeight;	///< passage weight factor
-		int					m_iQwordCount;		///< passage weight factor
-		int			m_iMaxLCS;					///< passage weight factor
-		int			m_iMinGap;					///< passage weight factor
-		int			m_iStartLimit;				///< start of match in passage
-		int			m_iEndLimit;				///< end of match in passage
-		int			m_iAroundBefore;			///< how many words before first matched words
-		int			m_iAroundAfter;				///< how many words after last matched words
-
-		void Reset ()
-		{
-			m_iStart = 0;
-			m_iTokens = 0;
-			m_iCodes = 0;
-			m_uQwords = 0;
-			m_iQwordsWeight = 0;
-			m_iQwordCount = 0;
-			m_iMaxLCS = 0;
-			m_iMinGap = 0;
-			m_iAroundBefore = 0;
-			m_iAroundAfter = 0;
-		}
-
-		inline int GetWeight () const
-		{
-			return m_iQwordCount + m_iQwordsWeight*m_iMaxLCS + m_iMinGap;
-		}
-	};
-
-	enum KeywordStar_e
-	{
-		STAR_NONE	= 0,
-		STAR_FRONT	= 1 << 0,
-		STAR_BACK	= 1 << 1,
-		STAR_BOTH	= STAR_FRONT | STAR_BACK
-	};
-
-	struct Keyword_t
-	{
-		int		m_uStar;
-		int		m_iWord;
-		int		m_iLength;
-	};
-
-	// ZonePacked_t bits:
-	// 64-32	(32) - uint position ( in document words )
-	// 32-16	(16) - uint sibling ( index of sibling (open/closed) zone instance )
-	// 16-0		(0) - zone type for this instance
-	const CSphVector<ZonePacked_t> & GetZones () const { return m_dZones; }
-	const SmallStringHash_T<int> & GetZonesName () const { return m_hZones; }
-
-protected:
-	CSphVector<Token_t>		m_dTokens;		///< source text tokens
-	CSphVector<Token_t>		m_dWords;		///< query words tokens
-	int						m_iDocumentWords;
-	int						m_iPassageId;
-
-	CSphString				m_sBuffer; // FIXME!!! REMOVE!!! ME!!!
-
-	CSphVector<BYTE>		m_dResult;		///< result holder
-	int						m_iResultLen;	///< result codepoints count
-
-	CSphVector<Passage_t>	m_dPassages;	///< extracted passages
-
-	bool					m_bExactPhrase;
-
-	DWORD					m_uFoundWords;	///< found words mask
-	int						m_iQwordCount;
-	int						m_iLastWord;
-	CSphHitMarker *			m_pMarker;
-
-	CSphVector<char>		m_dKeywordsBuffer;
-	CSphVector<Keyword_t>	m_dKeywords;
-
-	CSphVector<ZonePacked_t>	m_dZones;		///< zones for current document
-	SmallStringHash_T<int>		m_hZones;	///< zones names
-	CSphVector<int>				m_dZonePos;	///< zones positions (in characters)
-	CSphVector<int>				m_dZoneParent;	///< zones parent type
-
-	bool					m_bUtf8;
-	int						m_iTotalCP;
-
-protected:
-	void					CalcPassageWeight ( Passage_t & tPass, const TokenSpan_t & tSpan, int iMaxWords, int iWordCountCoeff );
-	void					UpdateGaps ( Passage_t & tPass, const TokenSpan_t & tSpan, int iMaxWords );
-	bool					ExtractPassages ( const ExcerptQuery_t & q );
-	bool					ExtractPhrases ( const ExcerptQuery_t & q );
-
-	void					HighlightPhrase ( const ExcerptQuery_t & q, int iTok, int iEnd );
-	void					HighlightAll ( const ExcerptQuery_t & q );
-	void					HighlightStart ( const ExcerptQuery_t & q );
-	bool					HighlightBestPassages ( const ExcerptQuery_t & q );
-
-	void					ResultEmit ( const char * sLine, bool bHasMacro=false, int iPassageId=0, const char * sPostPassage=NULL );
-	void					ResultEmit ( const Token_t & sTok );
-
-	void					AddJunk ( int iStart, int iLength, int iBoundary );
-	void					AddBoundary ();
-
-	void					MarkHits ();
-
-	bool					SetupWindow ( TokenSpan_t & tSpan, Passage_t & tPass, int iFrom, int iCpLimit, const ExcerptQuery_t & q );
-	bool					FlushPassage ( const Passage_t & tPass, int iLCSThresh );
-};
-
-// find string sFind in first iLimit characters of sBuffer
-static BYTE * FindString ( BYTE * sBuffer, BYTE * sFind, int iLimit )
-{
-	assert ( iLimit > 0 );
-	assert ( sBuffer );
-	assert ( sFind );
-
-	iLimit++;
-	do
-	{
-		while ( *sBuffer!=*sFind )
-			if ( !*++sBuffer || !--iLimit ) return NULL;
-
-		int iSubLimit = iLimit;
-		BYTE * sSubFind = sFind;
-		BYTE * sSubBuffer = sBuffer;
-		while ( *sSubFind && *sSubBuffer && *sSubFind==*sSubBuffer++ )
-		{
-			sSubFind++;
-			if ( !--iSubLimit ) return NULL;
-		}
-		if ( !*sSubFind )
-			return sBuffer;
-	}
-	while ( *++sBuffer );
-
-	return NULL;
-}
-
-/// hitman used here in snippets
-typedef Hitman_c<8> HITMAN;
-
-/// snippets query words for different cases
-class ISnippetsQword : public ISphQword
-{
-public:
-	CSphString *							m_sBuffer;
-	CSphVector<ExcerptGen_c::Token_t> *		m_dTokens;
-	ISphTokenizer *							m_pTokenizer;
-	DWORD *									m_uFoundWords;
-
-	// word information, filled during query word setup
-	int			m_iWordLength;
-	int			m_iLastIndex;
-	DWORD		m_uWordMask;
-
-	// iterator state
-	CSphMatch	m_tMatch;
-	int			m_iToken;
-	int			m_iChunk;
-
-	typedef ExcerptGen_c::Token_t Token_t;
-
-	ISnippetsQword()
-		: m_iToken ( 0 )
-		, m_iChunk ( 0 )
-	{}
-
-	virtual void SeekHitlist ( SphOffset_t ) {}
-
-	virtual const CSphMatch & GetNextDoc ( DWORD * )
-	{
-		m_dQwordFields.Set();
-		if ( ( m_iChunk++ )==0 )
-		{
-			if ( GetNextHit()!=EMPTY_HIT )
-			{
-				m_tMatch.m_iDocID = 1;
-				m_iToken--;
-			} else
-				m_tMatch.m_iDocID = 0;
-		} else
-			m_tMatch.m_iDocID = 0;
-		return m_tMatch;
-	}
-
-	virtual const char * OnSetup ( CSphDict * )
-	{
-		m_iWordLength = strlen ( m_sDictWord.cstr() );
-		return m_sDictWord.cstr();
-	}
-};
-
-/// simple keyword match on id
-struct SnippetsQword_Exact_c: public ISnippetsQword
-{
-	virtual Hitpos_t GetNextHit ()
-	{
-		while ( m_iToken < m_dTokens->GetLength() )
-		{
-			Token_t & tToken = (*m_dTokens)[m_iToken++];
-			if ( tToken.m_eType!=ExcerptGen_c::TOK_WORD )
-				continue;
-
-			if ( tToken.m_iWordID==m_iWordID || tToken.m_iBlendID==m_iWordID )
-			{
-				tToken.m_uWords |= m_uWordMask;
-				*m_uFoundWords |= m_uWordMask;
-				return HITMAN::Create ( 0, tToken.m_uPosition, ( m_iToken-1 )==m_iLastIndex );
-			}
-		}
-		return EMPTY_HIT;
-	}
-};
-
-/// partial matches
-template < typename COMPARE > struct SnippetsQword_c: public ISnippetsQword
-{
-	virtual Hitpos_t GetNextHit ()
-	{
-		while ( m_iToken < m_dTokens->GetLength() )
-		{
-			Token_t & tToken = (*m_dTokens)[m_iToken++];
-			if ( tToken.m_eType!=ExcerptGen_c::TOK_WORD )
-				continue;
-
-			m_pTokenizer->SetBuffer ( (BYTE *) &m_sBuffer->cstr() [ tToken.m_iStart ], tToken.m_iLengthBytes );
-			BYTE * sToken = m_pTokenizer->GetToken(); // OPTIMIZE? token can be memorized and shared between qwords
-			if ( (*(COMPARE *)this).Match ( tToken, sToken ) )
-			{
-				tToken.m_uWords |= m_uWordMask;
-				*m_uFoundWords |= m_uWordMask;
-				return HITMAN::Create ( 0, tToken.m_uPosition, ( m_iToken-1 )==m_iLastIndex );
-			}
-		}
-		return EMPTY_HIT;
-	}
-};
-
-template < typename COMPARE >
-struct SnippetQword_Star_t : public SnippetsQword_c<COMPARE>
-{
-	virtual const char * OnSetup ( CSphDict * )
-	{
-		this->m_iWordLength = strlen ( this->m_sWord.cstr() );
-		return this->m_sWord.cstr();
-	}
-};
-
-struct SnippetsQword_StarFront_c : public SnippetQword_Star_t<SnippetsQword_StarFront_c>
-{
-	inline bool Match ( const Token_t & tToken, BYTE * sToken )
-	{
-		int iOffset = tToken.m_iLengthBytes - m_iWordLength;
-		return iOffset>=0 &&
-			memcmp ( m_sWord.cstr(), sToken + iOffset, m_iWordLength )==0;
-	}
-};
-
-struct SnippetsQword_StarBack_c : public SnippetQword_Star_t<SnippetsQword_StarBack_c>
-{
-	inline bool Match ( const Token_t & tToken, BYTE * sToken )
-	{
-		return ( tToken.m_iLengthBytes>=m_iWordLength ) &&
-			memcmp ( m_sWord.cstr(), sToken, m_iWordLength )==0;
-	}
-};
-
-struct SnippetsQword_StarBoth_c : public SnippetQword_Star_t<SnippetsQword_StarBoth_c>
-{
-	inline bool Match ( const Token_t & tToken, BYTE * sToken )
-	{
-		return FindString ( sToken, (BYTE *)m_sWord.cstr(), tToken.m_iLengthBytes )!=NULL;
-	}
-};
-
-
-struct SnippetsQword_ExactForm_c : public SnippetsQword_c<SnippetsQword_ExactForm_c>
-{
-	inline bool Match ( const Token_t & tToken, BYTE * sToken )
-	{
-		return tToken.m_iBlendID==m_iWordID || ( memcmp ( sToken, m_sDictWord.cstr()+1, m_iWordLength )==0 );
-	}
-
-	virtual const char* OnSetup ( CSphDict * pDict )
-	{
-		// FIXME!!! to match with blended parts it recalculates wordID for word without head '=' part
-
-		int iLen = m_sWord.Length()-1;
-		BYTE sTmp [ 3*SPH_MAX_WORD_LEN + 16 ];
-
-		assert ( iLen>0 && iLen<sizeof(sTmp) );
-		assert ( m_sWord.Begins ( "=" ) );
-		assert ( pDict && m_pTokenizer );
-
-		memcpy ( sTmp, m_sWord.cstr()+1, iLen );
-		sTmp[iLen] = '\0';
-
-		m_pTokenizer->SetBuffer ( sTmp, iLen );
-		while ( m_pTokenizer->GetToken()!=NULL )
-		{
-			if ( m_pTokenizer->TokenIsBlended() )
-			{
-				m_pTokenizer->SkipBlended();
-				m_iWordID = pDict->GetWordID ( sTmp );
-				break;
-			}
-		}
-
-		return SnippetsQword_c<SnippetsQword_ExactForm_c>::OnSetup ( pDict );
-	}
-};
-
-/// snippets query word setup
-/// FIXME! throw these away in favor of fastpath ones
-class SnippetsQwordSetup: public ISphQwordSetup
-{
-	ExcerptGen_c *		m_pGenerator;
-	ISphTokenizer *		m_pTokenizer;
-
-public:
-	SnippetsQwordSetup ( ExcerptGen_c * pGenerator, ISphTokenizer * pTokenizer )
-		: m_pGenerator ( pGenerator )
-		, m_pTokenizer ( pTokenizer )
-	{}
-
-	virtual ISphQword *		QwordSpawn ( const XQKeyword_t & tWord ) const;
-	virtual bool			QwordSetup ( ISphQword * pQword ) const;
-};
-
-ISphQword * SnippetsQwordSetup::QwordSpawn ( const XQKeyword_t & tWord ) const
-{
-	if ( tWord.m_sWord.cstr()[0]=='=' )
-		return new SnippetsQword_ExactForm_c;
-	switch ( tWord.m_uStarPosition )
-	{
-		case STAR_NONE:		return new SnippetsQword_Exact_c;
-		case STAR_FRONT:	return new SnippetsQword_StarFront_c;
-		case STAR_BACK:		return new SnippetsQword_StarBack_c;
-		case STAR_BOTH:		return new SnippetsQword_StarBoth_c;
-		default:			assert ( "impossible star position" && 0 ); return NULL;
-	}
-}
-
-bool SnippetsQwordSetup::QwordSetup ( ISphQword * pQword ) const
-{
-	ISnippetsQword * pWord = dynamic_cast<ISnippetsQword *> ( pQword );
-	if ( !pWord )
-		assert ( "query word setup failed" && 0 );
-
-	pWord->m_iLastIndex = m_pGenerator->m_iLastWord;
-	pWord->m_uWordMask = 1 << (m_pGenerator->m_iQwordCount++);
-	pWord->m_dTokens = &(m_pGenerator->m_dTokens);
-	pWord->m_sBuffer = &(m_pGenerator->m_sBuffer);
-	pWord->m_pTokenizer = m_pTokenizer;
-	pWord->m_uFoundWords = &m_pGenerator->m_uFoundWords;
-
-	pWord->m_iDocs = 1;
-	pWord->m_iHits = 1;
-	pWord->m_bHasHitlist = true;
-
-	const char * sWord = pWord->OnSetup ( m_pDict );
-
-	// add dummy word, used for passage weighting
-	const int iLength = m_pTokenizer->IsUtf8() ? sphUTF8Len ( sWord ) : strlen ( sWord );
-	m_pGenerator->m_dWords.Add().m_iLengthCP = iLength;
-	m_pGenerator->m_dKeywords.Add().m_iLength = iLength;
-
-	return true;
-}
-
-/////////////////////////////////////////////////////////////////////////////
-
-inline bool operator < ( const ExcerptGen_c::Token_t & a, const ExcerptGen_c::Token_t & b )
-{
-	if ( a.m_iLengthCP==b.m_iLengthCP )
-		return a.m_iStart > b.m_iStart;
-	return a.m_iLengthCP < b.m_iLengthCP;
-}
-
-
-inline bool operator < ( const ExcerptGen_c::Passage_t & a, const ExcerptGen_c::Passage_t & b )
-{
-	if ( a.GetWeight()==b.GetWeight() )
-		return a.m_iCodes < b.m_iCodes;
-	return a.GetWeight() < b.GetWeight();
-}
-
-ExcerptGen_c::ExcerptGen_c ( bool bUtf8 )
-{
-	m_iQwordCount = 0;
-	m_bExactPhrase = false;
-	m_pMarker = NULL;
-	m_uFoundWords = 0;
-	m_bUtf8 = bUtf8;
-	m_iTotalCP = 0;
-}
-
-void ExcerptGen_c::AddBoundary()
-{
-	Token_t & tLast = m_dTokens.Add();
-	tLast.Reset();
-	tLast.m_eType = TOK_BREAK;
-}
-
-void ExcerptGen_c::AddJunk ( int iStart, int iLength, int iBoundary )
-{
-	assert ( iLength>0 );
-#ifdef PARANOID
-	assert ( iLength<=m_sBuffer.Length() );
-	assert ( iStart+iLength<=m_sBuffer.Length() );
-#endif
-
-	int iChunkStart = iStart;
-	int iSaved = 0;
-
-	for ( int i = iStart; i < iStart+iLength; i++ )
-		if ( sphIsSpace ( m_sBuffer.cstr () [i] )!=sphIsSpace ( m_sBuffer.cstr () [iChunkStart] ) )
-		{
-			Token_t & tLast = m_dTokens.Add();
-			tLast.Reset();
-			tLast.m_eType = TOK_SPACE;
-			tLast.m_iStart = iChunkStart;
-			tLast.m_iLengthBytes = tLast.m_iLengthCP = i - iChunkStart;
-			if ( m_bUtf8 )
-				tLast.m_iLengthCP = sphUTF8Len ( m_sBuffer.cstr() + tLast.m_iStart, tLast.m_iLengthBytes );
-			m_iTotalCP += tLast.m_iLengthCP;
-
-			iChunkStart = i;
-			iSaved += tLast.m_iLengthBytes;
-
-			if ( iBoundary!=-1 && iSaved > ( iBoundary-iStart ) )
-			{
-				AddBoundary();
-				iBoundary = -1;
-			}
-		}
-
-	Token_t & tLast = m_dTokens.Add();
-	tLast.Reset();
-	tLast.m_eType = TOK_SPACE;
-	tLast.m_iStart = iChunkStart;
-	tLast.m_iLengthBytes = tLast.m_iLengthCP = iStart + iLength - iChunkStart;
-	if ( m_bUtf8 )
-		tLast.m_iLengthCP = sphUTF8Len ( m_sBuffer.cstr() + tLast.m_iStart, tLast.m_iLengthBytes );
-	m_iTotalCP += tLast.m_iLengthCP;
-
-	if ( iBoundary!=-1 )
-		AddBoundary();
-}
-
-
-void ExcerptGen_c::TokenizeQuery ( const ExcerptQuery_t & tQuery, CSphDict * pDict, ISphTokenizer * pTokenizer, const CSphIndexSettings & tSettings )
-{
-	// tokenize query words
-	int iWordsLength = strlen ( tQuery.m_sWords.cstr() );
-
-	m_dKeywords.Reserve ( MAX_HIGHLIGHT_WORDS );
-
-	BYTE * sWord;
-	int iKwIndex = 0;
-	int uPosition = 0;
-
-	pTokenizer->SetBuffer ( (BYTE *)tQuery.m_sWords.cstr(), iWordsLength );
-	while ( ( sWord = pTokenizer->GetToken() )!=NULL )
-	{
-		SphWordID_t iWord = pDict->GetWordID ( sWord );
-
-		bool bIsStopWord = false;
-		if ( !iWord )
-			bIsStopWord = pDict->IsStopWord ( sWord );
-
-		if ( !pTokenizer->TokenIsBlended() )
-		{
-			uPosition += pTokenizer->GetOvershortCount();
-
-			if ( pTokenizer->GetBoundary() )
-				uPosition += tSettings.m_iBoundaryStep;
-
-			if ( iWord || bIsStopWord )
-				uPosition = bIsStopWord ? uPosition+tSettings.m_iStopwordStep : uPosition+1;
-		}
-
-		if ( iWord )
-		{
-			Token_t & tLast = m_dWords.Add();
-			tLast.m_eType = TOK_WORD;
-			tLast.m_iWordID = iWord;
-			tLast.m_iLengthBytes = tLast.m_iLengthCP = strlen ( (const char *)sWord );
-			if ( m_bUtf8 )
-				tLast.m_iLengthCP = sphUTF8Len ( (const char *)sWord );
-			m_iTotalCP += tLast.m_iLengthCP;
-			tLast.m_uPosition = uPosition;
-
-			// store keyword
-			Keyword_t & kwLast = m_dKeywords.Add();
-			kwLast.m_iLength = tLast.m_iLengthCP;
-
-			// find stars
-			bool bStarBack = ( *pTokenizer->GetTokenEnd()=='*' );
-			bool bStarFront = ( pTokenizer->GetTokenStart()!=pTokenizer->GetBufferPtr() ) &&
-				( pTokenizer->GetTokenStart()[-1]=='*' );
-			kwLast.m_uStar = ( bStarFront ? STAR_FRONT : 0 ) | ( bStarBack ? STAR_BACK : 0 );
-
-			// store token
-			const int iEndIndex = iKwIndex + tLast.m_iLengthBytes + 1;
-			m_dKeywordsBuffer.Resize ( iEndIndex );
-			kwLast.m_iWord = iKwIndex;
-			strcpy ( &m_dKeywordsBuffer [ iKwIndex ], (const char *)sWord ); // NOLINT
-			iKwIndex = iEndIndex;
-
-			if ( m_dWords.GetLength()==MAX_HIGHLIGHT_WORDS )
-				break;
-		}
-	}
-}
 
 static int FindTagEnd ( const char * sData )
 {
@@ -677,1093 +81,13 @@ int FindAddZone ( const char * sZoneName, int iZoneNameLen, SmallStringHash_T<in
 	return iZone;
 }
 
-// FIXME! unify with global static void TokenizeDocument somehow, lots of common code
-void ExcerptGen_c::TokenizeDocument ( char * pData, int iDataLen, CSphDict * pDict, ISphTokenizer * pTokenizer, bool bFillMasks, const ExcerptQuery_t & q, const CSphIndexSettings & tSettings )
+
+static inline int GetWordsLimit ( const ExcerptQuery_t & q, int iQwords )
 {
-	assert ( q.m_sStripMode!="retain" );
-	bool bQueryMode = q.m_bHighlightQuery;
-	int iSPZ = q.m_iPassageBoundary;
-
-	m_iTotalCP = 0;
-	m_iDocumentWords = 0;
-	m_dTokens.Reserve ( Max ( iDataLen/4, 256 ) ); // len/tok ratio ranged 2.8 to 3.2 on my testing data
-	m_sBuffer = pData;
-
-	pTokenizer->SetBuffer ( (BYTE*)pData, iDataLen );
-
-	const char * pStartPtr = pTokenizer->GetBufferPtr ();
-	const char * pLastTokenEnd = pStartPtr;
-
-	assert ( pStartPtr && pLastTokenEnd );
-
-	CSphVector<int> dZoneStack;
-	CSphVector<int> dExactPhrase;
-	if ( m_bExactPhrase )
-		dExactPhrase.Reserve ( m_dWords.GetLength() );
-
-	BYTE * sWord;
-	DWORD uPosition = 0; // hit position in document
-	SphWordID_t iBlendID = 0;
-	const char * pBlendedEnd = NULL;
-	while ( ( sWord = pTokenizer->GetToken() )!=NULL )
-	{
-		if ( pTokenizer->TokenIsBlended() )
-		{
-			if ( pBlendedEnd<pTokenizer->GetTokenEnd() )
-			{
-				iBlendID = pDict->GetWordID ( sWord );
-				pBlendedEnd = pTokenizer->GetTokenEnd();
-			}
-			continue;
-		}
-
-		uPosition += pTokenizer->GetOvershortCount();
-
-		const char * pTokenStart = pTokenizer->GetTokenStart ();
-
-		if ( pTokenStart!=pStartPtr && pTokenStart>pLastTokenEnd )
-		{
-			AddJunk ( pLastTokenEnd - pStartPtr,
-				pTokenStart - pLastTokenEnd,
-				pTokenizer->GetBoundary() ? pTokenizer->GetBoundaryOffset() : -1 );
-			pLastTokenEnd = pTokenStart;
-		}
-
-		// handle SPZ tokens GE then needed
-		// add SENTENCE, PARAGRAPH, ZONE token, do junks and tokenizer and pLastTokenEnd fix up
-		// FIXME!!! it heavily depends on such this attitude MAGIC_CODE_SENTENCE < MAGIC_CODE_PARAGRAPH < MAGIC_CODE_ZONE
-		if ( *sWord==MAGIC_CODE_SENTENCE || *sWord==MAGIC_CODE_PARAGRAPH || *sWord==MAGIC_CODE_ZONE )
-		{
-			// SPZ token has position and could be last token too
-			uPosition += ( iSPZ && *sWord>=iSPZ );
-
-			if ( iSPZ && *sWord>=iSPZ && ( m_dTokens.GetLength()==0 || m_dTokens.Last().m_eType!=TOK_SPZ ) )
-			{
-				Token_t & tLast = m_dTokens.Add();
-				tLast.Reset();
-				tLast.m_eType = TOK_SPZ;
-
-				if ( *sWord==MAGIC_CODE_SENTENCE )
-				{
-					tLast.m_iStart = pTokenStart-pStartPtr;
-					tLast.m_iLengthBytes = tLast.m_iLengthCP = 1;
-					m_iTotalCP++;
-				}
-
-				// SPZ token has position and could be last token too
-				m_iLastWord = m_dTokens.GetLength();
-				pLastTokenEnd = pTokenizer->GetTokenEnd(); // fix it up to prevent adding last chunk on exit
-			}
-
-			if ( *sWord==MAGIC_CODE_ZONE )
-			{
-				const char * pEnd = pTokenizer->GetBufferPtr();
-				const char * pTagStart = pEnd;
-				while ( *pEnd && *pEnd!=MAGIC_CODE_ZONE )
-					pEnd++;
-				pEnd++; // skip zone token too
-				pTokenizer->SetBufferPtr ( pEnd );
-				pLastTokenEnd = pEnd; // fix it up to prevent adding last chunk on exit
-
-				// span's management
-				if ( *pTagStart!='/' )	// open zone
-				{
-					// zone stack management
-					int iSelf = m_dZones.GetLength();
-					dZoneStack.Add ( iSelf );
-
-					// add zone itself
-					int iZone = FindAddZone ( pTagStart, pEnd-pTagStart-1, m_hZones );
-					m_dZones.Add ( sphPackZone ( uPosition, iSelf, iZone ) );
-
-					// zone position in characters
-					m_dZonePos.Add ( pTagStart-pStartPtr );
-
-					// for open zone the parent is the zone itself
-					m_dZoneParent.Add ( iZone );
-				} else					// close zone
-				{
-#ifndef NDEBUG
-					// lets check open - close tags match
-					assert ( dZoneStack.GetLength() && dZoneStack.Last()<m_dZones.GetLength() );
-					int iOpening = m_dZonePos [ dZoneStack.Last() ];
-					assert ( iOpening<pEnd-pStartPtr && strncmp ( pStartPtr+iOpening, pTagStart+1, pEnd-pTagStart-2 )==0 );
-#endif
-					int iZone = FindAddZone ( pTagStart+1, pEnd-pTagStart-2, m_hZones );
-					int iOpen = dZoneStack.Last();
-					int iClose = m_dZones.GetLength();
-					uint64_t uOpenPacked = m_dZones[ iOpen ];
-					DWORD uOpenPos = (DWORD)( ( uOpenPacked>>32 ) & UINT32_MASK );
-					assert ( iZone==(int)( uOpenPacked & UINT16_MASK ) ); // check for zone's types match;
-
-					m_dZones[iOpen] = sphPackZone ( uOpenPos, iClose, iZone );
-					m_dZones.Add ( sphPackZone ( uPosition, iOpen, iZone ) );
-
-					// zone position in characters
-					m_dZonePos.Add ( pTagStart-pStartPtr );
-
-					// for close zone the parent is the previous zone on stack
-					int iParentZone = dZoneStack.GetLength()>2 ? dZoneStack[dZoneStack.GetLength()-2] : 0;
-					uint64_t uParentPacked = m_dZones.GetLength() && iParentZone<m_dZones.GetLength() ? m_dZones[iParentZone] : 0;
-					m_dZoneParent.Add ( (int)( uParentPacked & UINT16_MASK ) );
-
-					// pop up current zone from zone's stack
-					dZoneStack.Resize ( dZoneStack.GetLength()-1 );
-				}
-			}
-
-			continue;
-		}
-
-		pLastTokenEnd = pTokenizer->GetTokenEnd ();
-
-		SphWordID_t iExactID = 0;
-		if ( bQueryMode && tSettings.m_bIndexExactWords )
-		{
-			BYTE sBuf [ 3*SPH_MAX_WORD_LEN+4 ];
-			int iBytes = pLastTokenEnd - pTokenStart;
-			if ( iBytes+2>sizeof(sBuf) )
-				iBytes = sizeof(sBuf)-2;
-			memcpy ( sBuf + 1, sWord, iBytes );
-			sBuf[0] = MAGIC_WORD_HEAD_NONSTEMMED;
-			sBuf[iBytes+1] = '\0';
-
-			iExactID = pDict->GetWordIDNonStemmed ( sBuf );
-		}
-
-		SphWordID_t iWord = pDict->GetWordID ( sWord );
-
-		if ( pTokenizer->GetBoundary() )
-			uPosition += tSettings.m_iBoundaryStep;
-
-		bool bIsStopWord = false;
-		if ( !iWord )
-			bIsStopWord = pDict->IsStopWord ( sWord );
-
-		if ( iWord || bIsStopWord )
-			uPosition = bIsStopWord ? uPosition+tSettings.m_iStopwordStep : uPosition+1;
-
-		if ( !pTokenizer->TokenIsBlendedPart() )
-			iBlendID = 0;
-
-		Token_t & tLast = m_dTokens.Add();
-		tLast.m_eType = ( iWord || bIsStopWord ) ? TOK_WORD : TOK_SPACE;
-		tLast.m_uPosition = ( iWord || bIsStopWord ) ? uPosition : 0;
-		tLast.m_iStart = pTokenStart - pStartPtr;
-		tLast.m_iLengthBytes = tLast.m_iLengthCP = pLastTokenEnd - pTokenStart;
-		if ( m_bUtf8 && ( iWord || bIsStopWord ) )
-			tLast.m_iLengthCP = sphUTF8Len ( pTokenStart, tLast.m_iLengthBytes );
-		m_iTotalCP += tLast.m_iLengthCP;
-		tLast.m_iWordID = iWord;
-		tLast.m_iBlendID = iBlendID;
-		tLast.m_uWords = 0;
-		if ( iWord || bIsStopWord )
-			m_iDocumentWords++;
-
-		m_iLastWord = iWord ? m_dTokens.GetLength() - 1 : m_iLastWord;
-
-		// fill word mask
-		tLast.m_uWords = 0;
-
-		if ( bFillMasks && iWord )
-		{
-			bool bMatch = false;
-			int iOffset;
-
-			ARRAY_FOREACH ( nWord, m_dWords )
-			{
-				const char * sKeyword = &m_dKeywordsBuffer [ m_dKeywords[nWord].m_iWord ];
-				const Token_t & tToken = m_dWords[nWord];
-
-				switch ( m_dKeywords[nWord].m_uStar )
-				{
-				case STAR_NONE:
-					bMatch = ( iWord==tToken.m_iWordID || iExactID==tToken.m_iWordID );
-					break;
-
-				case STAR_FRONT:
-					iOffset = tLast.m_iLengthBytes - tToken.m_iLengthBytes;
-					bMatch = ( iOffset>=0 ) &&
-						( memcmp ( sKeyword, sWord + iOffset, tToken.m_iLengthBytes )==0 );
-					break;
-
-				case STAR_BACK:
-					bMatch = ( tLast.m_iLengthBytes>=tToken.m_iLengthBytes ) &&
-						( memcmp ( sKeyword, sWord, tToken.m_iLengthBytes )==0 );
-					break;
-
-				case STAR_BOTH:
-					bMatch = strstr ( (const char *)sWord, sKeyword )!=NULL;
-					break;
-				}
-
-				if ( bMatch )
-				{
-					tLast.m_uWords |= 1UL<<nWord;
-					m_uFoundWords |= 1UL<<nWord;
-				}
-			}
-
-			// check that bag of words in case of exact_phrase
-			if ( m_bExactPhrase )
-			{
-				// FIXME! maybe should keep and roll-back m_uFoundWords state
-				DWORD uExactWord = 1UL<<dExactPhrase.GetLength();
-				bool bExactFound = ( ( tLast.m_uWords & uExactWord )!=0 );
-				if ( bExactFound )
-				{
-					if ( dExactPhrase.GetLength()+1==m_dWords.GetLength() ) // phrase found, no need to track these QWords
-						dExactPhrase.Resize ( 0 );
-					else
-						dExactPhrase.Add ( m_dTokens.GetLength()-1 ); // maybe phrase, keep collecting QWords into phrase list
-				} else // clean up QWords from phrase and current one
-				{
-					ARRAY_FOREACH ( i, dExactPhrase )
-						m_dTokens[dExactPhrase[i]].m_uWords = 0;
-					dExactPhrase.Resize ( 0 );
-
-					if ( (tLast.m_uWords & 1 )!=0 ) // it could be beginning of another exact phrase
-						dExactPhrase.Add ( m_dTokens.GetLength()-1 );
-					else
-						tLast.m_uWords = 0;
-				}
-			}
-		}
-	}
-
-	// clean up tail QWords from phrase list
-	if ( m_bExactPhrase )
-	{
-		ARRAY_FOREACH ( i, dExactPhrase )
-			m_dTokens[dExactPhrase[i]].m_uWords = 0;
-	}
-
-	// last space if any
-	if ( pLastTokenEnd!=pTokenizer->GetBufferEnd() )
-	{
-		int iOffset = pTokenizer->GetBoundary() ? pTokenizer->GetBoundaryOffset() : -1;
-		AddJunk ( pLastTokenEnd - pStartPtr, pTokenizer->GetBufferEnd () - pLastTokenEnd, iOffset );
-	}
-
-	Token_t & tLast = m_dTokens.Add();
-	tLast.Reset();
-}
-
-void ExcerptGen_c::MarkHits ()
-{
-	assert ( m_pMarker );
-
-	// mark
-	CSphVector<SphHitMark_t> dMarked;
-	dMarked.Reserve ( m_dTokens.GetLength() );
-	m_pMarker->Mark ( dMarked );
-
-	// fix-up word masks
-	int iMarked = dMarked.GetLength();
-	int iTokens = m_dTokens.GetLength();
-	int i = 0, k = 0;
-	while ( i < iTokens )
-	{
-		// sync
-		while ( k < iMarked && m_dTokens[i].m_uPosition > dMarked[k].m_uPosition )
-			k++;
-
-		if ( k==iMarked ) // no more marked hits, clear tail
-		{
-			for ( ; i < iTokens; i++ )
-				m_dTokens[i].m_uWords = 0;
-			break;
-		}
-
-		// clear false matches
-		while ( dMarked[k].m_uPosition > m_dTokens[i].m_uPosition )
-		{
-			m_dTokens[i++].m_uWords = 0;
-			assert ( i<m_dTokens.GetLength() );
-		}
-
-		// skip tokens covered by hit's span
-		assert ( dMarked[k].m_uPosition==m_dTokens[i].m_uPosition );
-		assert ( dMarked[k].m_uSpan>=1 );
-		while ( dMarked[k].m_uSpan-- )
-		{
-			i++;
-			while ( i < iTokens && !m_dTokens[i].m_uPosition ) i++;
-		}
-	}
-}
-
-
-void ExcerptGen_c::SetExactPhrase ( const ExcerptQuery_t & tQuery )
-{
-	m_bExactPhrase = tQuery.m_bExactPhrase && ( m_dWords.GetLength()>1 );
-}
-
-
-char * ExcerptGen_c::BuildExcerpt ( const ExcerptQuery_t & tQuery )
-{
-	m_iPassageId = tQuery.m_iPassageId;
-
-	if ( tQuery.m_bHighlightQuery )
-		MarkHits();
-
-	// assign word weights
-	ARRAY_FOREACH ( i, m_dWords )
-		m_dWords[i].m_iWeight = m_dWords[i].m_iLengthCP; // FIXME! should obtain freqs from dict
-
-	// reset result
-	m_dResult.Reserve ( 16384 );
-	m_dResult.Resize ( 0 );
-	m_iResultLen = 0;
-
-	// do highlighting
-	if ( ( tQuery.m_iLimit<=0 || tQuery.m_iLimit>m_iTotalCP )
-		&& ( tQuery.m_iLimitWords<=0 || tQuery.m_iLimitWords>m_iDocumentWords ) )
-	{
-		HighlightAll ( tQuery );
-
-	} else
-	{
-		if ( !( ExtractPassages ( tQuery ) && HighlightBestPassages ( tQuery ) ) )
-		{
-			if ( tQuery.m_bAllowEmpty )
-				HighlightStart ( tQuery );
-		}
-	}
-
-	// alloc, fill and return the result
-	m_dResult.Add ( 0 );
-	char * pRes = new char [ m_dResult.GetLength() ];
-	memcpy ( pRes, &m_dResult[0], m_dResult.GetLength() );
-	m_dResult.Reset ();
-
-	return pRes;
-}
-
-
-void ExcerptGen_c::HighlightPhrase ( const ExcerptQuery_t & q, int iTok, int iEnd )
-{
-	int iPhrase = 0;
-	for ( ; iTok<=iEnd; iTok++ )
-	{
-		bool bQWord = m_dTokens[iTok].m_uWords!=0;
-
-		if ( bQWord && iPhrase==0 )
-			ResultEmit ( q.m_sBeforeMatch.cstr(), q.m_bHasBeforePassageMacro, m_iPassageId, q.m_sBeforeMatchPassage.cstr() );
-
-		ResultEmit ( m_dTokens[iTok] );
-		iPhrase += bQWord ? 1 : 0;
-
-		if ( bQWord && iPhrase==m_dWords.GetLength() )
-		{
-			ResultEmit ( q.m_sAfterMatch.cstr(), q.m_bHasAfterPassageMacro, m_iPassageId++, q.m_sAfterMatchPassage.cstr() );
-			iPhrase = 0;
-		}
-	}
-}
-
-
-void ExcerptGen_c::HighlightAll ( const ExcerptQuery_t & q )
-{
-	bool bOpen = false;
-	const int iMaxTok = m_dTokens.GetLength()-1; // skip last one, it's TOK_NONE
-
-	if ( m_bExactPhrase )
-	{
-		HighlightPhrase ( q, 0, iMaxTok );
-	} else
-	{
-		// bag of words
-		for ( int iTok=0; iTok<iMaxTok; iTok++ )
-		{
-			if ( ( m_dTokens[iTok].m_uWords!=0 ) ^ bOpen )
-			{
-				if ( bOpen )
-					ResultEmit ( q.m_sAfterMatch.cstr(), q.m_bHasAfterPassageMacro, m_iPassageId++, q.m_sAfterMatchPassage.cstr() );
-				else
-					ResultEmit ( q.m_sBeforeMatch.cstr(), q.m_bHasBeforePassageMacro, m_iPassageId, q.m_sBeforeMatchPassage.cstr() );
-				bOpen = !bOpen;
-			}
-			ResultEmit ( m_dTokens[iTok] );
-		}
-		if ( bOpen )
-			ResultEmit ( q.m_sAfterMatch.cstr(), q.m_bHasAfterPassageMacro, m_iPassageId++, q.m_sAfterMatchPassage.cstr() );
-	}
-}
-
-
-void ExcerptGen_c::HighlightStart ( const ExcerptQuery_t & q )
-{
-	// no matches found. just show the starting tokens
-	int i = 0;
-	while ( m_dTokens.GetLength() && ( m_iResultLen+m_dTokens[i].m_iLengthCP < q.m_iLimit || i==0 ) )
-	{
-		ResultEmit ( m_dTokens[i++] );
-		if ( i>=m_dTokens.GetLength() )
-			break;
-	}
-	ResultEmit ( q.m_sChunkSeparator.cstr() );
-}
-
-
-void ExcerptGen_c::ResultEmit ( const char * sLine, bool bHasMacro, int iPassageId, const char * sPostPassage )
-{
-	// plain old emit
-	while ( sLine && *sLine )
-	{
-		assert ( (*(BYTE*)sLine)<128 );
-		m_dResult.Add ( *sLine++ );
-		m_iResultLen++;
-	}
-
-	if ( !bHasMacro )
-		return;
-
-	char sBuf[16];
-	int iPassLen = snprintf ( sBuf, sizeof(sBuf), "%d", iPassageId );
-	for ( int i=0; i<iPassLen; i++ )
-	{
-		m_dResult.Add ( sBuf[i] );
-		m_iResultLen++;
-	}
-
-	while ( sPostPassage && *sPostPassage )
-	{
-		m_dResult.Add ( *sPostPassage++ );
-		m_iResultLen++;
-	}
-}
-
-
-void ExcerptGen_c::ResultEmit ( const Token_t & sTok )
-{
-	for ( int i=0; i<sTok.m_iLengthBytes; i++ )
-		m_dResult.Add ( m_sBuffer.cstr () [ i+sTok.m_iStart ] );
-
-	m_iResultLen += sTok.m_iLengthCP;
-}
-
-/////////////////////////////////////////////////////////////////////////////
-
-void ExcerptGen_c::CalcPassageWeight ( Passage_t & tPass, const TokenSpan_t & tSpan, int iMaxWords, int iWordCountCoeff )
-{
-	DWORD uLast = 0;
-	int iLCS = 1;
-	tPass.m_iMaxLCS = 1;
-
-	// calc everything
-	tPass.m_uQwords = 0;
-	tPass.m_iMinGap = iMaxWords-1;
-	tPass.m_iStartLimit = INT_MAX;
-	tPass.m_iEndLimit = INT_MIN;
-	tPass.m_iAroundBefore = tPass.m_iAroundAfter = 0;
-
-	int iWord = -1;
-	for ( int iTok=tSpan.m_iStart; iTok<=tSpan.m_iEnd; iTok++ )
-	{
-		Token_t & tTok = m_dTokens[iTok];
-		if ( tTok.m_eType!=TOK_WORD )
-			continue;
-		iWord++;
-
-		// update mask
-		tPass.m_uQwords |= tTok.m_uWords;
-
-		// update match boundary
-		if ( tTok.m_uWords )
-		{
-			tPass.m_iStartLimit = Min ( tPass.m_iStartLimit, iTok );
-			tPass.m_iEndLimit = Max ( tPass.m_iEndLimit, iTok );
-		}
-
-		// update LCS
-		uLast = tTok.m_uWords & ( uLast<<1 );
-		if ( uLast )
-		{
-			iLCS++;
-			tPass.m_iMaxLCS = Max ( iLCS, tPass.m_iMaxLCS );
-		} else
-		{
-			iLCS = 1;
-			uLast = tTok.m_uWords;
-		}
-
-		// update min gap
-		if ( tTok.m_uWords )
-		{
-			tPass.m_iMinGap = Min ( tPass.m_iMinGap, iWord );
-			tPass.m_iMinGap = Min ( tPass.m_iMinGap, tSpan.m_iWords-1-iWord );
-		}
-
-		tPass.m_iAroundBefore += ( tPass.m_uQwords==0 );
-		tPass.m_iAroundAfter = ( tTok.m_uWords ? 0 : tPass.m_iAroundAfter+1 );
-	}
-	assert ( tPass.m_iMinGap>=0 );
-	assert ( tSpan.m_iWords==iWord+1 );
-
-	// calc final weight
-	tPass.m_iQwordsWeight = 0;
-	tPass.m_iQwordCount = 0;
-
-	DWORD uWords = tPass.m_uQwords;
-	for ( int iWord=0; uWords; uWords >>= 1, iWord++ )
-		if ( uWords & 1 )
-	{
-		tPass.m_iQwordsWeight += m_dWords[iWord].m_iWeight;
-		tPass.m_iQwordCount++;
-	}
-
-	tPass.m_iMaxLCS *= iMaxWords;
-	tPass.m_iQwordCount *= iWordCountCoeff;
-}
-
-void ExcerptGen_c::UpdateGaps ( Passage_t & tPass, const TokenSpan_t & tSpan, int iMaxWords )
-{
-	tPass.m_iMinGap = iMaxWords-1;
-	tPass.m_iAroundBefore = tPass.m_iAroundAfter = 0;
-	DWORD uQwords = 0;
-	int iWord = -1;
-	for ( int iTok=tSpan.m_iStart; iTok<=tSpan.m_iEnd; iTok++ )
-	{
-		Token_t & tTok = m_dTokens[iTok];
-		if ( tTok.m_eType!=TOK_WORD )
-			continue;
-
-		iWord++;
-		if ( tTok.m_uWords )
-		{
-			tPass.m_iMinGap = Min ( tPass.m_iMinGap, iWord );
-			tPass.m_iMinGap = Min ( tPass.m_iMinGap, tSpan.m_iWords-1-iWord );
-		}
-
-		uQwords |= tTok.m_uWords;
-		tPass.m_iAroundBefore += ( uQwords==0 );
-		tPass.m_iAroundAfter = ( tTok.m_uWords ? 0 : tPass.m_iAroundAfter+1 );
-	}
-	assert ( tPass.m_iMinGap>=0 );
-}
-
-
-static int GetWordsLimit ( const ExcerptQuery_t & q, int iQwords )
-{
-	int iSoftLimit = 2*q.m_iAround + iQwords;
-	if ( q.m_iLimitWords )
-		return Min ( iSoftLimit, q.m_iLimitWords );
-
-	return iSoftLimit;
-}
-
-
-bool ExcerptGen_c::SetupWindow ( TokenSpan_t & tSpan, Passage_t & tPass, int i, int iCpLimit, const ExcerptQuery_t & q )
-{
-	assert ( i>=0 && i<m_dTokens.GetLength() );
-
-	tPass.Reset();
-	tPass.m_iStart = i;
-
-	for ( ; i<m_dTokens.GetLength(); i++ )
-	{
-		const Token_t & tToken = m_dTokens[i];
-
-		// skip starting whitespace
-		if ( tPass.m_iTokens==0 && tToken.m_eType!=TOK_WORD )
-		{
-			tPass.m_iStart++;
-			continue;
-		}
-
-		// stop when the window is large enough or meet SPZ
-		if ( ( tPass.m_iCodes + tToken.m_iLengthCP > iCpLimit ) || tSpan.m_iWords>=GetWordsLimit ( q, tSpan.m_iQwords ) || tToken.m_eType==TOK_SPZ )
-		{
-			tPass.m_iTokens += ( tToken.m_eType==TOK_SPZ && tToken.m_iLengthBytes>0 ); // only MAGIC_CODE_SENTENCE has length
-			return ( tToken.m_eType==TOK_SPZ );
-		}
-
-		// got token, update passage
-		tPass.m_iTokens++;
-		tPass.m_iCodes += tToken.m_iLengthCP;
-
-		if ( tToken.m_eType==TOK_WORD )
-			tSpan.Add ( i, m_dTokens[i].m_uWords!=0 );
-	}
-
-	return false;
-}
-
-bool ExcerptGen_c::FlushPassage ( const Passage_t & tPass, int iLCSThresh )
-{
-	if (!( tPass.m_uQwords && tPass.m_iMaxLCS>=iLCSThresh ))
-		return false;
-
-	// if it's the very first one, do add
-	if ( !m_dPassages.GetLength() )
-	{
-		m_dPassages.Add ( tPass );
-		return true;
-	}
-
-	// check if it's new or better
-	Passage_t & tLast = m_dPassages.Last();
-	if ( ( tPass.m_iStartLimit<=tLast.m_iStartLimit && tLast.m_iEndLimit<=tPass.m_iEndLimit )
-		|| ( tLast.m_iStartLimit<=tPass.m_iStartLimit && tPass.m_iEndLimit<=tLast.m_iEndLimit ) )
-	{
-		int iPassPre = tPass.m_iStartLimit - tPass.m_iStart + 1;
-		int iPassPost = tPass.m_iStart + tPass.m_iTokens - tPass.m_iEndLimit + 1;
-		float fPassGap = (float)Max ( iPassPre, iPassPost ) / (float)Min ( iPassPre, iPassPost );
-
-		int iLastPre = tLast.m_iStartLimit - tLast.m_iStart + 1;
-		int iLastPost = tLast.m_iStart + tLast.m_iTokens - tLast.m_iEndLimit + 1;
-		float fLastGap = (float)Max ( iLastPre, iLastPost ) / (float)Min ( iLastPre, iLastPost );
-
-		// centered snippet wins last passage
-		if ( tLast.GetWeight()<tPass.GetWeight() || ( tLast.GetWeight()==tPass.GetWeight() && fPassGap<fLastGap ) )
-			tLast = tPass;
-	} else
-		m_dPassages.Add ( tPass );
-
-	return true;
-}
-
-
-bool ExcerptGen_c::ExtractPassages ( const ExcerptQuery_t & q )
-{
-	m_dPassages.Reserve ( 256 );
-	m_dPassages.Resize ( 0 );
-
-	if ( q.m_bUseBoundaries )
-		return ExtractPhrases ( q );
-
-	// my current passage
-	TokenSpan_t tSpan;
-	Passage_t tPass;
-	tSpan.Reset ();
-	tPass.Reset ();
-
-	int iLCSThresh = 0;
-	if ( m_bExactPhrase )
-		iLCSThresh = m_dWords.GetLength() * GetWordsLimit ( q, m_dWords.GetLength() );
-	int iCpLimit = q.m_iLimit ? q.m_iLimit : INT_MAX;
-
-	// setup initial window
-	bool bSPZ = SetupWindow ( tSpan, tPass, 0, iCpLimit, q );
-
-	// move our window until the end of document
-	const int iCount = m_dTokens.GetLength();
-	bool bQwordsChanged = true;
-	for ( ;; )
-	{
-		// does current token span has any matching words at all?
-		if ( tSpan.m_iQwords )
-		{
-			// re-weight current passage, and submit it
-			// if there weren't any keyword changes, use a fast path that only updates gap values
-			if ( bQwordsChanged )
-				CalcPassageWeight ( tPass, tSpan, GetWordsLimit ( q, tSpan.m_iQwords ), 0 );
-			else
-				UpdateGaps ( tPass, tSpan, GetWordsLimit ( q, tSpan.m_iQwords ) );
-			tPass.m_iWords = tSpan.m_iWords;
-			if ( FlushPassage ( tPass, iLCSThresh ) )
-				bQwordsChanged = false;
-		}
-
-		int iToken = tPass.m_iStart + tPass.m_iTokens;
-		assert ( iToken<=iCount );
-		if ( iToken==iCount )
-			break;
-
-		if ( bSPZ )
-		{
-			tSpan.Reset();
-			bSPZ = SetupWindow ( tSpan, tPass, iToken, iCpLimit, q );
-			bQwordsChanged = true;
-			continue;
-		}
-
-		// add another word
-		for ( ; iToken < iCount; iToken++ )
-		{
-			tPass.m_iTokens++;
-			tPass.m_iCodes += m_dTokens[iToken].m_iLengthCP;
-			if ( m_dTokens[iToken].m_eType==TOK_WORD )
-			{
-				bool bQword = ( m_dTokens[iToken].m_uWords!=0 );
-				tSpan.Add ( iToken, bQword );
-				if ( bQword )
-					bQwordsChanged = true;
-				break;
-			}
-
-			if ( m_dTokens[iToken].m_eType==TOK_SPZ )
-			{
-				bSPZ = true;
-				bQwordsChanged = true;
-				break;
-			}
-		}
-		if ( iToken==iCount || bSPZ )
-			continue;
-
-		// drop front tokens until the window fits into both word and CP limits
-		while ( ( tPass.m_iCodes > iCpLimit || tSpan.m_iWords > GetWordsLimit ( q, tSpan.m_iQwords ) ) && tPass.m_iTokens!=1 )
-		{
-			if ( m_dTokens[tPass.m_iStart].m_eType==TOK_WORD )
-			{
-				// remove heading word from wordspan
-				assert ( m_dTokens[tSpan.m_iStart].m_eType==TOK_WORD );
-				if ( m_dTokens[tSpan.m_iStart].m_uWords )
-				{
-					tSpan.m_iQwords--;
-					bQwordsChanged = true;
-				}
-				tSpan.m_iStart++;
-				if ( tSpan.m_iStart > tSpan.m_iEnd )
-				{
-					tSpan.Reset();
-				} else
-				{
-					tSpan.m_iWords--;
-					while ( m_dTokens[tSpan.m_iStart].m_eType!=TOK_WORD )
-						tSpan.m_iStart++;
-				}
-			}
-
-			tPass.m_iCodes -= m_dTokens[tPass.m_iStart].m_iLengthCP;
-			tPass.m_iTokens--;
-			tPass.m_iStart++;
-		}
-	}
-
-	return m_dPassages.GetLength()!=0;
-}
-
-
-bool ExcerptGen_c::ExtractPhrases ( const ExcerptQuery_t & )
-{
-	int iMaxWords = 100;
-	int iLCSThresh = m_bExactPhrase ? m_dWords.GetLength()*iMaxWords : 0;
-
-	int iStart = 0;
-	DWORD uWords = 0;
-
-	ARRAY_FOREACH ( iTok, m_dTokens )
-	{
-		// phrase boundary found, go flush
-		if ( m_dTokens[iTok].m_eType==TOK_BREAK || m_dTokens[iTok].m_eType==TOK_NONE )
-		{
-			int iEnd = iTok - 1;
-
-			// emit non-empty phrases with matching words as passages
-			if ( iStart<iEnd && uWords!=0 )
-			{
-				Passage_t tPass;
-				tPass.Reset ();
-
-				tPass.m_iStart = iStart;
-				tPass.m_iTokens = iEnd-iStart+1;
-
-				TokenSpan_t tSpan;
-				tSpan.Reset ();
-
-				for ( int i=iStart; i<=iEnd; i++ )
-				{
-					tPass.m_iCodes += m_dTokens[i].m_iLengthCP;
-					if ( m_dTokens[i].m_eType==TOK_WORD )
-						tSpan.Add ( i, m_dTokens[i].m_uWords!=0 );
-				}
-
-				CalcPassageWeight ( tPass, tSpan, iMaxWords, 10000 );
-				if ( tPass.m_iMaxLCS>=iLCSThresh )
-				{
-					tPass.m_iWords = tSpan.m_iWords;
-					m_dPassages.Add ( tPass );
-				}
-			}
-
-			if ( m_dTokens[iTok].m_eType==TOK_NONE )
-				break;
-
-			iStart = iTok + 1;
-			uWords = 0;
-		}
-
-		// just an incoming token
-		if ( m_dTokens[iTok].m_eType==TOK_WORD )
-			uWords |= m_dTokens[iTok].m_uWords;
-	}
-
-	return m_dPassages.GetLength()!=0;
-}
-
-
-struct PassageOrder_fn
-{
-	inline bool IsLess ( const ExcerptGen_c::Passage_t & a, const ExcerptGen_c::Passage_t & b ) const
-	{
-		return a.m_iStart < b.m_iStart;
-	}
-};
-
-
-bool ExcerptGen_c::HighlightBestPassages ( const ExcerptQuery_t & tQuery )
-{
-	assert ( m_dPassages.GetLength() );
-
-	// needed for "slightly outta limit" check below
-	int iKeywordsLength = 0;
-	ARRAY_FOREACH ( i, m_dKeywords )
-		iKeywordsLength += m_dKeywords[i].m_iLength;
-
-	// our limits
-	int iMaxPassages = tQuery.m_iLimitPassages
-		? Min ( m_dPassages.GetLength(), tQuery.m_iLimitPassages )
-		: m_dPassages.GetLength();
-	int iMaxWords = tQuery.m_iLimitWords ? tQuery.m_iLimitWords : INT_MAX;
-	int iMaxCp = tQuery.m_iLimit ? tQuery.m_iLimit : INT_MAX;
-
-	// our best passages
-	CSphVector<Passage_t> dShow;
-	DWORD uWords = 0; // mask of words in dShow so far
-	int iTotalCodes = 0;
-	int iTotalWords = 0;
-	bool bAroundComply = true;
-
-	CSphVector<int> dWeights ( m_dPassages.GetLength() );
-	ARRAY_FOREACH ( i, m_dPassages )
-		dWeights[i] = m_dPassages[i].m_iQwordsWeight;
-
-	// collect enough best passages to show all keywords and max out the limits
-	// don't care much if we're going over limits in this loop, it will be tightened below
-	bool bAll = false;
-	while ( dShow.GetLength() < iMaxPassages )
-	{
-		// get next best passage
-		int iBest = -1;
-		ARRAY_FOREACH ( i, m_dPassages )
-		{
-			if ( m_dPassages[i].m_iCodes && ( iBest==-1 || m_dPassages[iBest] < m_dPassages[i] ) )
-				iBest = i;
-		}
-		if ( iBest<0 )
-			break;
-		Passage_t & tBest = m_dPassages[iBest];
-
-		// does this passage fit the limits?
-		bool bFits = ( iTotalCodes + tBest.m_iCodes<=iMaxCp ) && ( iTotalWords + tBest.m_iWords<=iMaxWords );
-		bAroundComply &= ( Max ( tBest.m_iAroundBefore, tBest.m_iAroundAfter )<=tQuery.m_iAround );
-
-		// all words will be shown and we're outta limit
-		if ( uWords==m_uFoundWords && !bFits )
-		{
-			// there might be just enough space to partially display this passage
-			if ( ( iTotalCodes + iKeywordsLength )<=tQuery.m_iLimit )
-				dShow.Add ( tBest );
-			break;
-		}
-
-		// save it, despite limits or whatever, we'll tighten everything in the loop below
-		dShow.Add ( tBest );
-		uWords |= tBest.m_uQwords;
-		iTotalWords += tBest.m_iWords;
-		iTotalCodes += tBest.m_iCodes;
-		tBest.m_iCodes = 0; // no longer needed here, abusing to mark displayed passages
-
-		// we just managed to show all words? do one final re-weighting run
-		if ( !bAll && uWords==m_uFoundWords )
-		{
-			bAll = true;
-			ARRAY_FOREACH ( i, m_dPassages )
-				m_dPassages[i].m_iQwordsWeight = dWeights[i];
-		}
-
-		// if we're already showing all words, re-weighting is not needed any more
-		if ( bAll )
-			continue;
-
-		// re-weight passages, adjust for new mask of shown words
-		ARRAY_FOREACH ( i, m_dPassages )
-		{
-			if ( !m_dPassages[i].m_iCodes )
-				continue;
-			DWORD uMask = tBest.m_uQwords;
-			for ( int iWord=0; uMask; iWord++, uMask >>= 1 )
-				if ( ( uMask & 1 ) && ( m_dPassages[i].m_uQwords & ( 1UL<<iWord ) ) )
-					m_dPassages[i].m_iQwordsWeight -= m_dWords[iWord].m_iWeight;
-			m_dPassages[i].m_uQwords &= ~uWords;
-		}
-	}
-
-	// fix-up around constraint
-	if ( !bAroundComply )
-	{
-		ARRAY_FOREACH ( i, dShow )
-		{
-			Passage_t & tPass = dShow[i];
-			while ( tQuery.m_iAround<tPass.m_iAroundBefore )
-			{
-				assert ( tPass.m_iStart<tPass.m_iStartLimit );
-				const Token_t & tTok = m_dTokens[tPass.m_iStart];
-				assert ( tTok.m_uWords==0 );
-
-				tPass.m_iCodes -= tTok.m_iLengthCP;
-				iTotalCodes -= tTok.m_iLengthCP;
-
-				tPass.m_iAroundBefore -= ( tTok.m_eType==TOK_WORD );
-				iTotalWords -= ( tTok.m_eType==TOK_WORD );
-
-				tPass.m_iStart++;
-				tPass.m_iTokens--;
-			}
-			while ( tQuery.m_iAround<tPass.m_iAroundAfter )
-			{
-				assert ( tPass.m_iEndLimit<( tPass.m_iStart + tPass.m_iTokens - 1 ) );
-				const Token_t & tTok = m_dTokens[tPass.m_iStart+tPass.m_iTokens-1];
-				assert ( tTok.m_uWords==0 );
-
-				tPass.m_iCodes -= tTok.m_iLengthCP;
-				iTotalCodes -= tTok.m_iLengthCP;
-
-				tPass.m_iAroundAfter -= ( tTok.m_eType==TOK_WORD );
-				iTotalWords -= ( tTok.m_eType==TOK_WORD );
-
-				tPass.m_iTokens--;
-			}
-		}
-	}
-
-	// if all passages won't fit into the limit, try to trim them a bit
-	//
-	// this step is skipped when use_boundaries is enabled, because
-	// each passage must be a separate sentence (delimited by
-	// boundaries) and we don't want to split them
-	if ( ( iTotalCodes > iMaxCp || iTotalWords > iMaxWords ) && !tQuery.m_bUseBoundaries )
-	{
-		// trim passages
-		bool bFirst = true;
-		bool bDone = false;
-		int iCodes = iTotalCodes;
-		while ( !bDone )
-		{
-			// drop one token from each passage starting from the least relevant
-			for ( int i=dShow.GetLength(); i > 0; i-- )
-			{
-				Passage_t & tPassage = dShow[i-1];
-				int iFirst = tPassage.m_iStart;
-				int iLast = tPassage.m_iStart + tPassage.m_iTokens - 1;
-				if ( iFirst!=tPassage.m_iStartLimit && ( bFirst || iLast==tPassage.m_iEndLimit ) )
-				{
-					// drop first
-					if ( ( tQuery.m_bForceAllWords && m_dTokens[tPassage.m_iStart].m_uWords==0 )
-						|| !tQuery.m_bForceAllWords )
-						tPassage.m_iStart++;
-					tPassage.m_iTokens--;
-					tPassage.m_iCodes -= m_dTokens[iFirst].m_iLengthCP;
-					iTotalCodes -= m_dTokens[iFirst].m_iLengthCP;
-					iTotalWords -= ( m_dTokens[iFirst].m_eType==TOK_WORD );
-
-				} else if ( iLast!=tPassage.m_iEndLimit )
-				{
-					// drop last
-					if ( ( tQuery.m_bForceAllWords && m_dTokens[tPassage.m_iStart+tPassage.m_iTokens-1].m_uWords==0 )
-						|| !tQuery.m_bForceAllWords )
-						tPassage.m_iTokens--;
-					tPassage.m_iCodes -= m_dTokens[iLast].m_iLengthCP;
-					iTotalCodes -= m_dTokens[iLast].m_iLengthCP;
-					iTotalWords -= ( m_dTokens[iLast].m_eType==TOK_WORD );
-				}
-				if ( iTotalCodes<=iMaxCp && iTotalWords<=iMaxWords )
-				{
-					bDone = true;
-					break;
-				}
-			}
-			if ( iTotalCodes==iCodes )
-				break; // couldn't reduce anything
-			iCodes = iTotalCodes;
-			bFirst = !bFirst;
-		}
-	}
-
-	// if passages still don't fit start dropping least significant ones, limit is sacred.
-	while ( ( iTotalCodes > iMaxCp || iTotalWords > iMaxWords ) && !tQuery.m_bForceAllWords )
-	{
-		iTotalCodes -= dShow.Last().m_iCodes;
-		iTotalWords -= dShow.Last().m_iWords;
-		dShow.RemoveFast ( dShow.GetLength()-1 );
-	}
-
-	if ( !dShow.GetLength() )
-		return false;
-
-	// sort passages in the document order
-	if ( !tQuery.m_bWeightOrder )
-		dShow.Sort ( PassageOrder_fn() );
-
-	/// show
-	int iLast = -1;
-	bool bEmitZones = tQuery.m_bEmitZones && m_dZones.GetLength();
-	ARRAY_FOREACH ( i, dShow )
-	{
-		int iTok = dShow[i].m_iStart;
-		int iEnd = iTok + dShow[i].m_iTokens - 1;
-
-		if ( ( iLast>=0 && iLast<m_dTokens.GetLength() && m_dTokens[iLast].m_eType==TOK_SPZ ) || iTok>1+iLast || tQuery.m_bWeightOrder )
-		{
-			ResultEmit ( tQuery.m_sChunkSeparator.cstr() );
-			// find and emit most enclosing zone
-			if ( bEmitZones )
-			{
-				int iHighlightStart = m_dTokens[iTok].m_iStart;
-				int iZone = FindSpan ( m_dZonePos, iHighlightStart );
-				if ( iZone!=-1 )
-				{
-					int iParent = m_dZoneParent[iZone];
-					m_hZones.IterateStart();
-					while ( m_hZones.IterateNext() )
-					{
-						if ( m_hZones.IterateGet()!=iParent )
-							continue;
-
-						ResultEmit ( "<" );
-						ResultEmit ( m_hZones.IterateGetKey().cstr() );
-						ResultEmit ( ">" );
-						break;
-					}
-				}
-			}
-		}
-
-		if ( m_bExactPhrase )
-			HighlightPhrase ( tQuery, iTok, iEnd );
-		else
-		{
-			while ( iTok<=iEnd )
-			{
-				if ( iTok>iLast || tQuery.m_bWeightOrder )
-				{
-					if ( m_dTokens[iTok].m_uWords )
-					{
-						ResultEmit ( tQuery.m_sBeforeMatch.cstr(), tQuery.m_bHasBeforePassageMacro, m_iPassageId, tQuery.m_sBeforeMatchPassage.cstr() );
-						ResultEmit ( m_dTokens[iTok] );
-						ResultEmit ( tQuery.m_sAfterMatch.cstr(), tQuery.m_bHasAfterPassageMacro, m_iPassageId++, tQuery.m_sAfterMatchPassage.cstr() );
-					} else
-						ResultEmit ( m_dTokens[iTok] );
-				}
-				iTok++;
-			}
-		}
-
-		iLast = tQuery.m_bWeightOrder ? iEnd : Max ( iLast, iEnd );
-	}
-	if ( m_dTokens[iLast].m_eType!=TOK_NONE && m_dTokens[iLast+1].m_eType!=TOK_NONE )
-		ResultEmit ( tQuery.m_sChunkSeparator.cstr() );
-
-	return true;
+	return q.m_iLimitWords ? q.m_iLimitWords : 2*q.m_iAround + iQwords;
 }
 
 //////////////////////////////////////////////////////////////////////////
-// FAST PATH FOR FULL DOCUMENT HIGHLIGHTING
-//////////////////////////////////////////////////////////////////////////
-
 struct DocQueryZonePair_t
 {
 	int m_iDoc;
@@ -1786,7 +110,8 @@ private:
 	CSphVector<ZoneHits_t> m_dZones;
 
 public:
-	SnippetZoneChecker_c ( const CSphVector<ZonePacked_t> & dDocZones, const SmallStringHash_T<int> & hDocNames, const CSphVector<CSphString> & dQueryZones )
+	SnippetZoneChecker_c ( const CSphVector<ZonePacked_t> & dDocZones,
+		const SmallStringHash_T<int> & hDocNames, const CSphVector<CSphString> & dQueryZones )
 	{
 		if ( !dQueryZones.GetLength() )
 			return;
@@ -1854,16 +179,17 @@ public:
 #endif
 	}
 
-	virtual SphZoneHit_e IsInZone ( int iZone, const ExtHit_t * pHit )
+	virtual SphZoneHit_e IsInZone ( int iZone, const ExtHit_t * pHit, int * pLastSpan )
 	{
-		Hitpos_t uPos = HITMAN::GetLCS ( pHit->m_uHitpos );
-		int iOpen = FindSpan ( m_dZones[iZone].m_dOpen, uPos );
-		return ( iOpen>=0 && uPos<=m_dZones[iZone].m_dClose[iOpen] ) ? SPH_ZONE_FOUND : SPH_ZONE_NO_SPAN;
+		DWORD uPosWithField = HITMAN::GetPosWithField ( pHit->m_uHitpos );
+		int iOpen = FindSpan ( m_dZones[iZone].m_dOpen, uPosWithField );
+		if ( pLastSpan )
+			* pLastSpan = iOpen;
+		return ( iOpen>=0 && uPosWithField<=m_dZones[iZone].m_dClose[iOpen] ) ? SPH_ZONE_FOUND : SPH_ZONE_NO_SPAN;
 	}
 };
 
 //////////////////////////////////////////////////////////////////////////
-
 /// mini-index for a single document
 /// keeps query words
 /// keeps hit lists for every query keyword
@@ -1875,82 +201,146 @@ public:
 	CSphVector< CSphVector<int> >			m_dDocHits;
 
 	// query parsing result
-	XQQuery_t								m_tQuery;
+	const XQQuery_t	&						m_tQuery;
 
 protected:
 	// query keywords and parsing stuff
-	CSphVector<SphWordID_t>					m_dQueryWords;
-	CSphVector<ExcerptGen_c::Keyword_t>		m_dStarWords;
+	struct Keyword_t
+	{
+		int			m_iWord;
+		int			m_iLength;
+		bool		m_bStar;
+		int			m_iWeight;
+		int			m_iQueryPos;
+	};
+
+	struct Term_t
+	{
+		SphWordID_t	m_iWordId;
+		int			m_iWeight;
+		int			m_iQueryPos;
+	};
+
+	CSphVector<Term_t>						m_dTerms;
+	CSphVector<SphWordID_t>					m_dStarred;
+	CSphVector<Keyword_t>					m_dStars;
 	CSphVector<BYTE>						m_dStarBuffer;
+	CSphVector<int>							m_dQposToWeight;
 
 	bool									m_bQueryMode;
-	bool									m_bSentence;
-	bool									m_bParagraph;
 	BYTE									m_sTmpWord [ 3*SPH_MAX_WORD_LEN + 16 ];
 
 public:
-	explicit	SnippetsDocIndex_c ( bool bQueryMode );
+	SnippetsDocIndex_c ( bool bQueryMode, const XQQuery_t & tQuery );
 	void		SetupHits ();
 	int			FindWord ( SphWordID_t iWordID, const BYTE * sWord, int iWordLen ) const;
+	int			FindStarred ( const char * sWord ) const;
 	void		AddHits ( SphWordID_t iWordID, const BYTE * sWord, int iWordLen, DWORD uPosition );
-	bool		Parse ( const char * sQuery, ISphTokenizer * pTokenizer, CSphDict * pDict, const CSphSchema * pSchema, CSphString & sError, int iStopwordStep );
+	void		ParseQuery ( const char * sQuery, ISphTokenizer * pTokenizer, CSphDict * pDict, DWORD eExtQuerySPZ );
+	int			GetTermWeight ( int iQueryPos ) const;
+	int			GetNumTerms () const;
 
 protected:
-	bool		MatchStar ( const ExcerptGen_c::Keyword_t & tTok, const BYTE * sWord, int iWordLen ) const;
-	void		AddWord ( SphWordID_t iWordID );
-	void		AddWord ( const char * sWord, int iStarPosition );
-	void		ExtractWords ( XQNode_t * pNode, CSphDict * pDict );
+	bool		MatchStar ( const Keyword_t & tTok, const BYTE * sWord ) const;
+	void		AddWord ( SphWordID_t iWordID, int iLengthCP, int iQpos );
+	void		AddWordStar ( const char * sWord, int iLengthCP, int iQpos );
+	int			ExtractWords ( XQNode_t * pNode, ISphTokenizer * pTokenizer, CSphDict * pDict, int iQpos );
+
+	struct KeywordCmp_t
+	{
+		const char * m_pBase;
+		explicit KeywordCmp_t ( const char * pBase )
+			: m_pBase ( pBase )
+		{}
+
+		inline int Cmp ( const Keyword_t & a, const Keyword_t & b ) const
+		{
+			assert ( m_pBase );
+			return strncmp ( m_pBase + a.m_iWord, m_pBase + b.m_iWord, 3*SPH_MAX_WORD_LEN+4 );
+		}
+
+		inline bool IsLess ( const Keyword_t & a, const Keyword_t & b ) const
+		{
+			int iCmp = Cmp ( a, b );
+			if ( iCmp==0 )
+				return a.m_iQueryPos<b.m_iQueryPos;
+			else
+				return iCmp<0;
+		}
+
+		bool IsSameTerm ( const Keyword_t & a, const Keyword_t & b ) const
+		{
+			return Cmp ( a, b )==0;
+		}
+	};
+
+	struct TermCmp_t
+	{
+		inline bool IsLess ( const Term_t & a, const Term_t & b ) const
+		{
+			if ( a.m_iWordId==b.m_iWordId )
+				return a.m_iQueryPos<b.m_iQueryPos;
+			else
+				return a.m_iWordId<b.m_iWordId;
+		}
+
+		bool IsSameTerm ( const Term_t & a, const Term_t & b ) const
+		{
+			return ( a.m_iWordId==b.m_iWordId );
+		}
+	};
 };
 
 
-SnippetsDocIndex_c::SnippetsDocIndex_c ( bool bQueryMode )
+SnippetsDocIndex_c::SnippetsDocIndex_c ( bool bQueryMode, const XQQuery_t & tQuery )
 	: m_uLastPos ( 0 )
+	, m_tQuery ( tQuery )
 	, m_bQueryMode ( bQueryMode )
-	, m_bSentence ( false )
-	, m_bParagraph ( false )
 {}
 
 
 void SnippetsDocIndex_c::SetupHits ()
 {
-	m_dDocHits.Resize ( m_dQueryWords.GetLength() + m_dStarWords.GetLength() );
+	m_dDocHits.Resize ( m_dTerms.GetLength() + m_dStars.GetLength() );
 	m_uLastPos = 0;
 }
 
 
-bool SnippetsDocIndex_c::MatchStar ( const ExcerptGen_c::Keyword_t & tTok, const BYTE * sWord, int iWordLen ) const
+bool SnippetsDocIndex_c::MatchStar ( const Keyword_t & tTok, const BYTE * sWord ) const
 {
-	assert ( tTok.m_uStar!=STAR_NONE );
+	assert ( tTok.m_bStar );
 	const BYTE * sKeyword = m_dStarBuffer.Begin() + tTok.m_iWord;
-
-	switch ( tTok.m_uStar )
-	{
-	case STAR_FRONT:
-		{
-			int iOffset = iWordLen - tTok.m_iLength;
-			return ( iOffset>=0 ) && ( memcmp ( sKeyword, sWord + iOffset, tTok.m_iLength )==0 );
-		}
-
-	case STAR_BACK:
-		return ( iWordLen>=tTok.m_iLength ) && ( memcmp ( sKeyword, sWord, tTok.m_iLength )==0 );
-
-	case STAR_BOTH:
-		return strstr ( (const char *)sWord, (const char *)sKeyword )!=NULL;
-	}
-	return false;
+	return sphWildcardMatch ( (const char*)sWord, (const char*)sKeyword );
 }
 
 
 int SnippetsDocIndex_c::FindWord ( SphWordID_t iWordID, const BYTE * sWord, int iWordLen ) const
 {
-	const SphWordID_t * pQueryID = iWordID ? m_dQueryWords.BinarySearch ( iWordID ) : NULL;
-	if ( pQueryID )
-		return pQueryID - m_dQueryWords.Begin();
+	const Term_t * pQueryTerm = iWordID ? m_dTerms.BinarySearch ( bind ( &Term_t::m_iWordId ), iWordID ) : NULL;
+	if ( pQueryTerm )
+		return pQueryTerm->m_iQueryPos;
 
 	if ( sWord && iWordLen )
-		ARRAY_FOREACH ( i, m_dStarWords )
-			if ( MatchStar ( m_dStarWords[i], sWord, iWordLen ) )
-				return i + m_dQueryWords.GetLength();
+		ARRAY_FOREACH ( i, m_dStars )
+			if ( MatchStar ( m_dStars[i], sWord ) )
+				return m_dStars[i].m_iQueryPos;
+
+	return -1;
+}
+
+int SnippetsDocIndex_c::FindStarred ( const char * sWord ) const
+{
+	if ( !sWord )
+		return -1;
+
+	const BYTE * pBuf = m_dStarBuffer.Begin();
+	int iLen = strlen ( sWord );
+	ARRAY_FOREACH ( i, m_dStars )
+	{
+		const Keyword_t & tTok = m_dStars[i];
+		if ( tTok.m_iLength==iLen && tTok.m_bStar && memcmp ( pBuf+tTok.m_iWord, sWord, iLen )==0 )
+			return m_dStars[i].m_iQueryPos;
+	}
 
 	return -1;
 }
@@ -1958,24 +348,79 @@ int SnippetsDocIndex_c::FindWord ( SphWordID_t iWordID, const BYTE * sWord, int 
 
 void SnippetsDocIndex_c::AddHits ( SphWordID_t iWordID, const BYTE * sWord, int iWordLen, DWORD uPosition )
 {
-	assert ( m_dDocHits.GetLength()==m_dQueryWords.GetLength()+m_dStarWords.GetLength() );
+	assert ( m_dDocHits.GetLength()==m_dTerms.GetLength()+m_dStars.GetLength() );
 
-	const SphWordID_t * pQueryWord = ( iWordID ? m_dQueryWords.BinarySearch ( iWordID ) : NULL );
-	if ( pQueryWord )
+	// FIXME!!! replace to 6well formed full-blown infix keyword dict
+	const Term_t * pQueryTerm = iWordID ? m_dTerms.BinarySearch ( bind ( &Term_t::m_iWordId ), iWordID ) : NULL;
+	if ( pQueryTerm )
 	{
-		m_dDocHits [ pQueryWord - m_dQueryWords.Begin() ].Add ( uPosition );
-		return;
+		int iQPos = pQueryTerm->m_iQueryPos;
+		if ( !m_dDocHits[iQPos].GetLength() || DWORD( m_dDocHits[iQPos].Last() )!=uPosition )
+			m_dDocHits [iQPos].Add ( uPosition );
+
+		// might add hit to star hit-list too
+		if ( !m_dStarred.BinarySearch ( iWordID ) )
+			return;
 	}
 
 	if ( sWord && iWordLen )
-		ARRAY_FOREACH ( i, m_dStarWords )
-			if ( MatchStar ( m_dStarWords[i], sWord, iWordLen ) )
-				m_dDocHits [ m_dQueryWords.GetLength() + i ].Add ( uPosition );
+		ARRAY_FOREACH ( i, m_dStars )
+			if ( MatchStar ( m_dStars[i], sWord ) )
+			{
+				int iQPos = m_dStars[i].m_iQueryPos;
+				if ( !m_dDocHits[iQPos].GetLength() || DWORD ( m_dDocHits[iQPos].Last() )!=uPosition )
+					m_dDocHits [iQPos].Add ( uPosition );
+			}
+}
+
+static bool HasStars ( const XQKeyword_t & w )
+{
+	return w.m_sWord.Begins("*") || w.m_sWord.Ends("*");
 }
 
 
-bool SnippetsDocIndex_c::Parse ( const char * sQuery, ISphTokenizer * pTokenizer, CSphDict * pDict, const CSphSchema * pSchema, CSphString & sError, int iStopwordStep )
+template<typename T>
+void TermShiftDownQpos ( CSphVector<T> & dTerms, const CSphVector<int> & dRemovedQPos )
 {
+	if ( !dRemovedQPos.GetLength() )
+		return;
+
+	ARRAY_FOREACH ( i, dTerms )
+	{
+		int iCurQPos = dTerms[i].m_iQueryPos;
+		int iRemoved = 0;
+		while ( iRemoved<dRemovedQPos.GetLength() && iCurQPos>dRemovedQPos[iRemoved] )
+			iRemoved++;
+
+		dTerms[i].m_iQueryPos = iCurQPos - iRemoved;
+	}
+}
+
+template<typename T, typename CMP>
+void TermRemoveDup ( CSphVector<T> & dTerms, CSphVector<int> & dRemovedQPos, const CMP & tCmp )
+{
+	assert ( dTerms.GetLength()>1 );
+
+	int iSrc = 1, iDst = 1;
+	while ( iSrc<dTerms.GetLength() )
+	{
+		if ( tCmp.IsSameTerm ( dTerms[iDst-1], dTerms[iSrc] ) )
+		{
+			dRemovedQPos.Add ( dTerms[iSrc].m_iQueryPos );
+			iSrc++;
+		} else
+		{
+			dTerms[iDst++] = dTerms[iSrc++];
+		}
+	}
+	dTerms.Resize ( iDst );
+}
+
+
+void SnippetsDocIndex_c::ParseQuery ( const char * sQuery, ISphTokenizer * pTokenizer, CSphDict * pDict, DWORD eExtQuerySPZ )
+{
+	int iQPos = 0;
+
 	if ( !m_bQueryMode )
 	{
 		// parse bag-of-words query
@@ -1984,69 +429,147 @@ bool SnippetsDocIndex_c::Parse ( const char * sQuery, ISphTokenizer * pTokenizer
 
 		BYTE * sWord = NULL;
 		// FIXME!!! add warning on query words overflow
-		while ( ( sWord = pTokenizer->GetToken() )!=NULL && ( m_dQueryWords.GetLength() + m_dStarWords.GetLength() )<MAX_HIGHLIGHT_WORDS )
+		while ( ( sWord = pTokenizer->GetToken() )!=NULL && iQPos<MAX_HIGHLIGHT_WORDS )
 		{
 			SphWordID_t uWordID = pDict->GetWordID ( sWord );
-			if ( !uWordID )
-				continue;
+			if ( uWordID )
+			{
+				if ( sWord[0]=='*' || sWord [ strlen ( (const char*)sWord )-1 ]=='*' )
+					AddWordStar ( (const char *)sWord, pTokenizer->GetLastTokenLen(), iQPos );
+				else
+					AddWord ( uWordID, pTokenizer->GetLastTokenLen(), iQPos );
 
-			bool bStarBack = ( *pTokenizer->GetTokenEnd()=='*' );
-			bool bStarFront = ( pTokenizer->GetTokenStart()!=pTokenizer->GetBufferPtr() ) &&
-				( pTokenizer->GetTokenStart()[-1]=='*' );
-			int uStar = ( bStarFront ? STAR_FRONT : 0 ) | ( bStarBack ? STAR_BACK : 0 );
-
-			if ( uStar )
-				AddWord ( (const char *)sWord, uStar );
-			else
-				AddWord ( uWordID );
+				iQPos++;
+			}
+			if ( pTokenizer->TokenIsBlended() )
+				pTokenizer->SkipBlended();
 		}
-
 	} else
 	{
-		// parse extended query
-		if ( !sphParseExtendedQuery ( m_tQuery, sQuery, pTokenizer, pSchema, pDict, iStopwordStep ) )
-		{
-			sError = m_tQuery.m_sParseError;
-			return false;
-		}
+		iQPos = ExtractWords ( m_tQuery.m_pRoot, pTokenizer, pDict, iQPos );
 
-		m_tQuery.m_pRoot->ClearFieldMask();
-		ExtractWords ( m_tQuery.m_pRoot, pDict );
-
-		if ( m_bSentence )
+		if ( eExtQuerySPZ & SPH_SPZ_SENTENCE )
 		{
 			strncpy ( (char *)m_sTmpWord, MAGIC_WORD_SENTENCE, sizeof(m_sTmpWord) );
-			AddWord ( pDict->GetWordID ( m_sTmpWord ) );
+			AddWord ( pDict->GetWordID ( m_sTmpWord ), strlen ( (char*)m_sTmpWord ), iQPos );
+			iQPos++;
 		}
-		if ( m_bParagraph )
+		if ( eExtQuerySPZ & SPH_SPZ_PARAGRAPH )
 		{
 			strncpy ( (char *)m_sTmpWord, MAGIC_WORD_PARAGRAPH, sizeof(m_sTmpWord) );
-			AddWord ( pDict->GetWordID ( m_sTmpWord ) );
+			AddWord ( pDict->GetWordID ( m_sTmpWord ), strlen ( (char*)m_sTmpWord ), iQPos );
+			iQPos++;
 		}
 
 		// should be in sync with ExtRanker_c constructor
 		ARRAY_FOREACH ( i, m_tQuery.m_dZones )
 		{
 			snprintf ( (char *)m_sTmpWord, sizeof(m_sTmpWord), "%c%s", MAGIC_CODE_ZONE, m_tQuery.m_dZones[i].cstr() );
-			AddWord ( pDict->GetWordID ( m_sTmpWord ) );
+			AddWord ( pDict->GetWordID ( m_sTmpWord ), strlen ( (char*)m_sTmpWord ), iQPos );
+			iQPos++;
 		}
 	}
 
-	// all ok, remove dupes, and return
-	m_dQueryWords.Uniq();
-	assert ( !m_dStarWords.GetLength() || m_dStarBuffer.GetLength() );
-	return true;
+	assert ( !m_dStars.GetLength() || m_dStarBuffer.GetLength() );
+
+	// all ok, remove dupes but keep their positions (needed to calculate LCS)
+	CSphVector<int> dRemovedQPos;
+	if ( m_dTerms.GetLength()>1 )
+	{
+		TermCmp_t tCmp;
+		m_dTerms.Sort ( tCmp );
+		TermRemoveDup ( m_dTerms, dRemovedQPos, tCmp );
+	}
+	if ( m_dStars.GetLength()>1 )
+	{
+		KeywordCmp_t tCmp ( (const char *)m_dStarBuffer.Begin() );
+		m_dStars.Sort ( tCmp );
+		TermRemoveDup ( m_dStars, dRemovedQPos, tCmp );
+	}
+	if ( dRemovedQPos.GetLength() )
+	{
+		dRemovedQPos.Sort();
+		TermShiftDownQpos ( m_dTerms, dRemovedQPos );
+		TermShiftDownQpos ( m_dStars, dRemovedQPos );
+	}
+
+	// per qpos weights
+	m_dQposToWeight.Resize ( m_dTerms.GetLength() + m_dStars.GetLength() );
+#ifndef NDEBUG
+	m_dQposToWeight.Fill ( -1 );
+#endif
+
+	ARRAY_FOREACH ( i, m_dTerms )
+		m_dQposToWeight[m_dTerms[i].m_iQueryPos] = m_dTerms[i].m_iWeight;
+	ARRAY_FOREACH ( i, m_dStars )
+		m_dQposToWeight[m_dStars[i].m_iQueryPos] = m_dStars[i].m_iWeight;
+
+#ifndef NDEBUG
+	bool bFilled = ARRAY_ANY ( bFilled, m_dQposToWeight, ( m_dQposToWeight[_any]==-1 ) );
+	assert ( !bFilled );
+#endif
+
+	// plain terms could also match as starred terms
+	if ( m_dStars.GetLength() && m_dTerms.GetLength() && m_bQueryMode )
+	{
+		CSphVector<const XQNode_t *> dChildren;
+		dChildren.Add ( m_tQuery.m_pRoot );
+		ARRAY_FOREACH ( i, dChildren )
+		{
+			const XQNode_t * pChild = dChildren[i];
+			if ( !pChild )
+				continue;
+
+			ARRAY_FOREACH ( j, pChild->m_dChildren )
+				dChildren.Add ( pChild->m_dChildren[j] );
+
+			ARRAY_FOREACH ( j, pChild->m_dWords )
+			{
+				if ( HasStars ( pChild->m_dWords[j] ) )
+					continue;
+
+				const BYTE * sWord = (const BYTE *)pChild->m_dWords[j].m_sWord.cstr();
+				int iLen = pChild->m_dWords[j].m_sWord.Length();
+				ARRAY_FOREACH ( k, m_dStars )
+				{
+					if ( MatchStar ( m_dStars[k], sWord ) )
+					{
+						memcpy ( m_sTmpWord, sWord, iLen );
+						m_dStarred.Add ( pDict->GetWordID ( m_sTmpWord ) );
+						break;
+					}
+				}
+			}
+		}
+
+		m_dStarred.Uniq();
+	}
 }
 
 
-void SnippetsDocIndex_c::AddWord ( SphWordID_t iWordID )
+int SnippetsDocIndex_c::GetTermWeight ( int iQueryPos ) const
+{
+	return m_dQposToWeight[iQueryPos];
+}
+
+
+int	SnippetsDocIndex_c::GetNumTerms () const
+{
+	return m_dQposToWeight.GetLength();
+}
+
+
+void SnippetsDocIndex_c::AddWord ( SphWordID_t iWordID, int iLengthCP, int iQpos )
 {
 	assert ( iWordID );
-	m_dQueryWords.Add ( iWordID );
+	Term_t & tTerm = m_dTerms.Add();
+	tTerm.m_iWordId = iWordID;
+	tTerm.m_iWeight = iLengthCP;
+	tTerm.m_iQueryPos = iQpos;
 }
 
 
-void SnippetsDocIndex_c::AddWord ( const char * sWord, int iStarPosition )
+void SnippetsDocIndex_c::AddWordStar ( const char * sWord, int iLengthCP, int iQpos )
 {
 	int iLen = strlen ( sWord );
 	int iOff = m_dStarBuffer.GetLength();
@@ -2055,79 +578,116 @@ void SnippetsDocIndex_c::AddWord ( const char * sWord, int iStarPosition )
 	memcpy ( &m_dStarBuffer[iOff], sWord, iLen );
 	m_dStarBuffer[iOff+iLen] = 0;
 
-	ExcerptGen_c::Keyword_t & tTok = m_dStarWords.Add();
+	Keyword_t & tTok = m_dStars.Add();
 	tTok.m_iWord = iOff;
 	tTok.m_iLength = iLen;
-	tTok.m_uStar = iStarPosition;
+	tTok.m_bStar = true;
+	tTok.m_iWeight = iLengthCP;
+	tTok.m_iQueryPos = iQpos;
 }
 
 
-void SnippetsDocIndex_c::ExtractWords ( XQNode_t * pNode, CSphDict * pDict )
+int SnippetsDocIndex_c::ExtractWords ( XQNode_t * pNode, ISphTokenizer * pTokenizer, CSphDict * pDict, int iQpos )
 {
-	m_bSentence |= ( pNode->GetOp()==SPH_QUERY_SENTENCE );
-	m_bParagraph |= ( pNode->GetOp()==SPH_QUERY_PARAGRAPH );
+	if ( !pNode )
+		return iQpos;
+
 	ARRAY_FOREACH ( i, pNode->m_dWords )
 	{
 		const XQKeyword_t & tWord = pNode->m_dWords[i];
-		if ( tWord.m_uStarPosition )
+
+		int iLenCP = sphUTF8Len ( tWord.m_sWord.cstr() );
+		if ( HasStars ( tWord ) )
 		{
-			AddWord ( tWord.m_sWord.cstr(), tWord.m_uStarPosition );
+			AddWordStar ( tWord.m_sWord.cstr(), iLenCP, iQpos );
+			iQpos++;
 		} else
 		{
 			strncpy ( (char *)m_sTmpWord, tWord.m_sWord.cstr(), sizeof(m_sTmpWord) );
 			SphWordID_t iWordID = pDict->GetWordID ( m_sTmpWord );
 			if ( iWordID )
-				AddWord ( iWordID );
+			{
+				AddWord ( iWordID, iLenCP, iQpos );
+				iQpos++;
+			}
 		}
 	}
 
 	ARRAY_FOREACH ( i, pNode->m_dChildren )
-		ExtractWords ( pNode->m_dChildren[i], pDict );
+		iQpos = ExtractWords ( pNode->m_dChildren[i], pTokenizer, pDict, iQpos );
+
+	return iQpos;
 }
 
+
 //////////////////////////////////////////////////////////////////////////
+struct FunctorZoneInfo_t
+{
+	SmallStringHash_T<int>	m_hZones;
+	CSphVector<int>			m_dZonePos;
+	CSphVector<int>			m_dZoneParent;
+};
+
 
 /// document token processor functor traits
 class TokenFunctorTraits_c : public ISphNoncopyable, public ExcerptQuery_t
 {
 public:
+	FunctorZoneInfo_t			m_tZoneInfo;
 	CSphVector<ZonePacked_t>	m_dZones;
-	SmallStringHash_T<int>		m_hZones;
-	CSphVector<BYTE>					m_dResult;
+	mutable CSphVector<BYTE>	m_dResult;
 
 	SnippetsDocIndex_c &	m_tContainer;
 	ISphTokenizer *			m_pTokenizer;
 	CSphDict *				m_pDict;
+	const char *			m_szDocBuffer;
 	const char *			m_pDoc;
+	const char *			m_pDocMax;
 
 	int		m_iBoundaryStep;
 	int		m_iStopwordStep;
 	bool	m_bIndexExactWords;
 	int		m_iDocLen;
+	int		m_iMatchesCount;
+	bool	m_bCollectExtraZoneInfo;
 
-	explicit TokenFunctorTraits_c ( SnippetsDocIndex_c & tContainer, ISphTokenizer * pTokenizer, CSphDict * pDict, const ExcerptQuery_t & tQuery, const CSphIndexSettings & tSettingsIndex, const char * sDoc, int iDocLen )
+	explicit TokenFunctorTraits_c ( SnippetsDocIndex_c & tContainer, ISphTokenizer * pTokenizer,
+		CSphDict * pDict, const ExcerptQuery_t & tQuery, const CSphIndexSettings & tSettingsIndex,
+		const char * sDoc, int iDocLen )
 		: m_tContainer ( tContainer )
 		, m_pTokenizer ( pTokenizer )
 		, m_pDict ( pDict )
+		, m_szDocBuffer ( sDoc )
 		, m_pDoc ( NULL )
+		, m_pDocMax ( NULL )
 		, m_iBoundaryStep ( tSettingsIndex.m_iBoundaryStep )
 		, m_iStopwordStep ( tSettingsIndex.m_iStopwordStep )
 		, m_bIndexExactWords ( tSettingsIndex.m_bIndexExactWords )
 		, m_iDocLen ( iDocLen )
+		, m_iMatchesCount ( 0 )
+		, m_bCollectExtraZoneInfo ( false )
 	{
 		assert ( m_pTokenizer && m_pDict );
 		ExcerptQuery_t::operator = ( tQuery );
 		m_pTokenizer->SetBuffer ( (BYTE*)sDoc, m_iDocLen );
 		m_pDoc = m_pTokenizer->GetBufferPtr();
+		m_pDocMax = m_pTokenizer->GetBufferEnd();
 	}
 
-	void ResultEmit ( const char * pSrc, int iLen, bool bHasPassageMacro=false, int iPassageId=0, const char * pPost=NULL, int iPostLen=0 )
+	void ResultEmit ( const char * pSrc, int iLen, bool bHasPassageMacro=false, int iPassageId=0,
+		const char * pPost=NULL, int iPostLen=0 ) const
+	{
+		ResultEmit ( m_dResult, pSrc, iLen, bHasPassageMacro, iPassageId, pPost, iPostLen );
+	}
+
+	void ResultEmit ( CSphVector<BYTE> & dResult, const char * pSrc, int iLen, bool bHasPassageMacro=false, int iPassageId=0,
+		const char * pPost=NULL, int iPostLen=0 ) const
 	{
 		if ( iLen>0 )
 		{
-			int iOutLen = m_dResult.GetLength();
-			m_dResult.Resize ( iOutLen+iLen );
-			memcpy ( &m_dResult[iOutLen], pSrc, iLen );
+			int iOutLen = dResult.GetLength();
+			dResult.Resize ( iOutLen+iLen );
+			memcpy ( &dResult[iOutLen], pSrc, iLen );
 		}
 
 		if ( !bHasPassageMacro )
@@ -2135,22 +695,441 @@ public:
 
 		char sBuf[16];
 		int iPassLen = snprintf ( sBuf, sizeof(sBuf), "%d", iPassageId );
-		int iOutLen = m_dResult.GetLength();
-		m_dResult.Resize ( iOutLen + iPassLen + iPostLen );
+		int iOutLen = dResult.GetLength();
+		dResult.Resize ( iOutLen + iPassLen + iPostLen );
 
 		if ( iPassLen )
-			memcpy ( m_dResult.Begin()+iOutLen, sBuf, iPassLen );
+			memcpy ( dResult.Begin()+iOutLen, sBuf, iPassLen );
 		if ( iPostLen )
-			memcpy ( m_dResult.Begin()+iOutLen+iPassLen, pPost, iPostLen );
+			memcpy ( dResult.Begin()+iOutLen+iPassLen, pPost, iPostLen );
+	}
+};
+
+//////////////////////////////////////////////////////////////////////////
+
+struct TokenInfo_t
+{
+	int				m_iStart;
+	int				m_iLen;
+	const BYTE *	m_sWord;
+	DWORD			m_uPosition;
+	bool			m_bWord;
+	bool			m_bStopWord;
+	int				m_iTermIndex;
+
+	SphWordID_t		m_uWordId;
+};
+
+
+/// functor that maps collected tokens into a stream
+class CacheStreamer_c
+{
+private:
+	enum
+	{
+		TYPE_TOKEN1 = 0,	///< 1-byte token (4-bit code, and 4-bit len payload)
+		TYPE_TOKEN2,		///< 2-byte token (4-bit code, and 8-bit len payload)
+		TYPE_OVERLAP1,		///< 1-byte overlap (4-bit code, and 4-bit len payload)
+		TYPE_TOKOVER1,		///< 1-byte token/overlap combo (4-bit code, 4-bit token len (overlap len is always 1))
+		TYPE_TOKOVER2,		///< 1-byte token/overlap combo (4-bit code, 4-bit token len (overlap len is always 2))
+		TYPE_TOKOVER3,		///< 1-byte token/overlap combo (4-bit code, 4-bit token len (overlap len is always 3))
+		TYPE_TOKOVER4,		///< 1-byte token/overlap combo (4-bit code, 4-bit token len (overlap len is always 4))
+		TYPE_TOKOVER5,		///< 1-byte token/overlap combo (4-bit code, 3-bit token len, 1-bit overlap len)
+		TYPE_TOKEN,			///< generic fat token
+		TYPE_OVERLAP,		///< generic fat overlap
+		TYPE_SKIPHTML,
+		TYPE_SPZ,
+		TYPE_TAIL,
+
+		TYPE_TOTAL
+	};
+	STATIC_ASSERT ( TYPE_TOTAL<=15, OUT_OF_TYPECODES );
+
+public:
+	FunctorZoneInfo_t *		m_pZoneInfo;
+
+private:
+	CSphTightVector<BYTE>	m_dTokenStream;
+	int						m_iReadPtr;
+	int						m_iLastStart;	///< last delta coded token offset, in bytes
+	int						m_iLastPos;		///< last delta coded token number, in tokens
+	int						m_eLastStored;
+
+public:
+	explicit CacheStreamer_c ( int iDocLen )
+		: m_pZoneInfo ( NULL )
+		, m_iReadPtr ( 0 )
+		, m_iLastStart ( 0 )
+		, m_iLastPos ( 0 )
+		, m_eLastStored ( TYPE_TOTAL )
+	{
+		m_dTokenStream.Reserve ( (iDocLen*2)/5 );
+		m_dTokenStream.Add ( 0 );
 	}
 
-	virtual void OnOverlap ( int iStart, int iLen ) = 0;
-	virtual void OnSkipHtml ( int iStart, int iLen ) = 0;
-	virtual void OnToken ( int iStart, int iLen, const BYTE * sWord, DWORD uPosition, const CSphVector<SphWordID_t> & dWordids ) = 0;
-	virtual void OnSPZ ( BYTE iSPZ, DWORD uPosition, char * sZoneName ) = 0;
-	virtual void OnTail ( int iStart, int iLen ) = 0;
-	virtual void OnFinish () = 0;
-	virtual const CSphVector<int> * GetHitlist ( const XQKeyword_t & tWord ) const = 0;
+	inline BYTE * StoreEntry ( int iBytes )
+	{
+		m_dTokenStream.Resize ( m_dTokenStream.GetLength() + iBytes );
+		return m_dTokenStream.Begin() + m_dTokenStream.GetLength() - iBytes;
+	}
+
+	void StoreOverlap ( int iStart, int iLen, int iBoundary )
+	{
+		assert ( iLen>0 && iLen<=USHRT_MAX );
+
+		int iDstart = iStart - m_iLastStart;
+		m_iLastStart = iStart + iLen;
+
+		if ( iDstart==0 && iLen<16 && iBoundary<0 )
+		{
+			// try to store a token+overlap combo
+			if ( m_eLastStored==TYPE_TOKEN1 )
+			{
+				int iTokLen = m_dTokenStream.Last() & 15;
+				assert ( iTokLen > 0 );
+
+				if ( iLen<=4 && iTokLen<=16 )
+				{
+					BYTE uType = (BYTE)(TYPE_TOKOVER1+iLen-1);
+					m_dTokenStream.Last() = ( uType<<4 )+ (BYTE)iTokLen-1;
+					m_eLastStored = uType;
+					return;
+				} else if ( iLen>=5 && iLen<=6 && iTokLen<=8 )
+				{
+					m_dTokenStream.Last() = (BYTE)( ( TYPE_TOKOVER5<<4 ) + ( ( iTokLen-1 ) << 1 ) + iLen-5 );
+					m_eLastStored = TYPE_TOKOVER5;
+					return;
+				}
+			}
+
+			// OVERLAP1, most frequent path
+			// delta_start is 0, boundary is -1, length fits in 4 bits, so just 1 byte
+			m_dTokenStream.Add ( (BYTE)( ( TYPE_OVERLAP1<<4 ) + iLen ) );
+			m_eLastStored = TYPE_OVERLAP1;
+			return;
+		}
+
+		// OVERLAP, stupid generic uncompressed path (can optimize with deltas, if needed)
+		BYTE * p = StoreEntry ( 11 );
+		p[0] = ( TYPE_OVERLAP<<4 );
+		sphUnalignedWrite ( p+1, iStart );
+		sphUnalignedWrite ( p+5, WORD(iLen) );
+		sphUnalignedWrite ( p+7, iBoundary );
+		m_eLastStored = TYPE_OVERLAP;
+	}
+
+	void StoreSkipHtml ( int iStart, int iLen )
+	{
+		m_dTokenStream.Add ( TYPE_SKIPHTML<<4 );
+		ZipInt ( iStart );
+		ZipInt ( iLen );
+		m_eLastStored = TYPE_SKIPHTML;
+	}
+
+	void StoreToken ( const TokenInfo_t & tTok )
+	{
+		assert ( tTok.m_iTermIndex<USHRT_MAX );
+		assert ( tTok.m_iLen<=255 );
+
+		int iDstart = tTok.m_iStart - m_iLastStart;
+		int iDpos = tTok.m_uPosition - m_iLastPos;
+
+		m_iLastStart = tTok.m_iStart + tTok.m_iLen;
+		m_iLastPos = tTok.m_uPosition;
+
+		if ( iDstart==0 && iDpos==1 && tTok.m_bWord && !tTok.m_bStopWord && tTok.m_iTermIndex==-1 )
+		{
+			if ( tTok.m_iLen<16 )
+			{
+				// TOKEN1, most frequent path
+				m_dTokenStream.Add ( (BYTE)( ( TYPE_TOKEN1<<4 ) + tTok.m_iLen ) );
+				m_eLastStored = TYPE_TOKEN1;
+				return;
+			} else
+			{
+				// TOKEN2, 2nd most frequent path
+				m_dTokenStream.Add ( (BYTE)( TYPE_TOKEN2<<4 ) );
+				m_dTokenStream.Add ( (BYTE) tTok.m_iLen );
+				m_eLastStored = TYPE_TOKEN2;
+				return;
+			}
+		}
+
+		// TOKEN, stupid generic uncompressed path (can optimize with deltas, if needed)
+		BYTE * p = StoreEntry ( 13 );
+
+		p[0] = ( TYPE_TOKEN<<4 );
+		sphUnalignedWrite ( p+1, tTok.m_iStart );
+		p[5] = BYTE(tTok.m_iLen);
+		sphUnalignedWrite ( p+6, tTok.m_uPosition );
+		p[10] = ( tTok.m_bWord<<1 ) + tTok.m_bStopWord;
+		sphUnalignedWrite ( p+11, (WORD)(tTok.m_iTermIndex+1) );
+		m_eLastStored = TYPE_TOKEN;
+	}
+
+	void StoreSPZ ( BYTE iSPZ, DWORD uPosition, const char *, int iZone )
+	{
+		m_dTokenStream.Add ( TYPE_SPZ<<4 );
+		ZipInt ( iSPZ );
+		ZipInt ( uPosition );
+		ZipInt ( iZone==-1 ? 0 : 1 );
+		if ( iZone!=-1 )
+			ZipInt ( iZone );
+
+		m_eLastStored = TYPE_SPZ;
+	}
+
+	void StoreTail ( int iStart, int iLen, int iBoundary )
+	{
+		m_dTokenStream.Add ( TYPE_TAIL<<4 );
+		ZipInt ( iStart );
+		ZipInt ( iLen );
+		ZipInt ( iBoundary==-1 ? 0 : 1 );
+		if ( iBoundary!=-1 )
+			ZipInt ( iBoundary );
+
+		m_eLastStored = TYPE_TAIL;
+	}
+
+	template < typename T >
+	void Tokenize ( T & tFunctor )
+	{
+		m_iLastStart = 0;
+		m_iLastPos = 0;
+
+		m_iReadPtr = 1;
+		TokenInfo_t tTok;
+		bool bStop = false;
+		CSphVector<SphWordID_t> dTmp;
+
+		while ( m_iReadPtr < m_dTokenStream.GetLength() )
+		{
+			switch ( m_dTokenStream [ m_iReadPtr ]>>4 )
+			{
+			case TYPE_OVERLAP1:
+				{
+					int iLen = m_dTokenStream [ m_iReadPtr++ ] & 15;
+					bStop = !tFunctor.OnOverlap ( m_iLastStart, iLen, -1 );
+					m_iLastStart += iLen;
+				}
+				break;
+
+			case TYPE_OVERLAP:
+				{
+					BYTE * p = &m_dTokenStream [ m_iReadPtr ];
+					int iStart = sphUnalignedRead ( *(DWORD*)(p+1) );
+					int iLen = sphUnalignedRead ( *(WORD*)(p+5) );
+					int iBoundary = sphUnalignedRead ( *(int*)(p+7) );
+					m_iReadPtr += 11;
+					m_iLastStart = iStart + iLen;
+					bStop = !tFunctor.OnOverlap ( iStart, iLen, iBoundary );
+				}
+				break;
+
+			case TYPE_SKIPHTML:
+				{
+					m_iReadPtr++;
+					DWORD uStart = UnzipInt ();
+					DWORD uLen = UnzipInt ();
+					tFunctor.OnSkipHtml ( uStart, uLen );
+				}
+				break;
+
+			case TYPE_TOKEN:
+				{
+					BYTE * p = &m_dTokenStream [ m_iReadPtr ];
+					tTok.m_iStart = sphUnalignedRead ( *(DWORD*)(p+1) );
+					tTok.m_iLen = p[5];
+					tTok.m_uPosition = sphUnalignedRead ( *(DWORD*)(p+6) );
+					tTok.m_bWord = ( p[10] & 2 )!=0;
+					tTok.m_bStopWord = ( p[10] & 1 )!=0;
+					tTok.m_iTermIndex = (int)sphUnalignedRead ( *(WORD*)(p+11) ) - 1;
+					m_iReadPtr += 13;
+
+					m_iLastStart = tTok.m_iStart + tTok.m_iLen;
+					m_iLastPos = tTok.m_uPosition;
+
+					tTok.m_sWord = NULL;
+
+					bStop = !tFunctor.OnToken ( tTok, dTmp );
+				}
+				break;
+
+			case TYPE_TOKEN1:
+				{
+					tTok.m_iStart = m_iLastStart;
+					tTok.m_iLen = m_dTokenStream [ m_iReadPtr++ ] & 15;
+					m_iLastStart += tTok.m_iLen;
+					tTok.m_uPosition = ++m_iLastPos;
+					tTok.m_bWord = true;
+					tTok.m_bStopWord = false;
+					tTok.m_iTermIndex = -1;
+
+					tTok.m_sWord = NULL;
+
+					bStop = !tFunctor.OnToken ( tTok, dTmp );
+				}
+				break;
+
+			case TYPE_TOKEN2:
+				{
+					tTok.m_iStart = m_iLastStart;
+					tTok.m_iLen = m_dTokenStream [ ++m_iReadPtr ];
+					m_iReadPtr++;
+					m_iLastStart += tTok.m_iLen;
+					tTok.m_uPosition = ++m_iLastPos;
+					tTok.m_bWord = true;
+					tTok.m_bStopWord = false;
+					tTok.m_iTermIndex = -1;
+
+					tTok.m_sWord = NULL;
+
+					bStop = !tFunctor.OnToken ( tTok, dTmp );
+				}
+				break;
+
+			case TYPE_TOKOVER1:
+			case TYPE_TOKOVER2:
+			case TYPE_TOKOVER3:
+			case TYPE_TOKOVER4:
+				{
+					BYTE iStored = m_dTokenStream [ m_iReadPtr++ ];
+					int iLen = ( iStored>>4 ) - TYPE_TOKOVER1 + 1;
+
+					tTok.m_iStart = m_iLastStart;
+					tTok.m_iLen = ( iStored & 15 ) + 1;
+					m_iLastStart += tTok.m_iLen;
+					tTok.m_uPosition = ++m_iLastPos;
+					tTok.m_bWord = true;
+					tTok.m_bStopWord = false;
+					tTok.m_iTermIndex = -1;
+
+					tTok.m_sWord = NULL;
+
+					bStop = !tFunctor.OnToken ( tTok, dTmp );
+
+					if ( bStop )
+						break;
+
+					bStop = !tFunctor.OnOverlap ( m_iLastStart, iLen, -1 );
+					m_iLastStart += iLen;
+				}
+				break;
+
+			case TYPE_TOKOVER5:
+				{
+					BYTE iStored = m_dTokenStream [ m_iReadPtr++ ];
+
+					tTok.m_iStart = m_iLastStart;
+					tTok.m_iLen = ( ( iStored >> 1 ) & 7 ) + 1;
+					m_iLastStart += tTok.m_iLen;
+					tTok.m_uPosition = ++m_iLastPos;
+					tTok.m_bWord = true;
+					tTok.m_bStopWord = false;
+					tTok.m_iTermIndex = -1;
+
+					tTok.m_sWord = NULL;
+
+					bStop = !tFunctor.OnToken ( tTok, dTmp );
+
+					if ( bStop )
+						break;
+
+					int iLen = ( iStored & 1 ) + 5;
+					bStop = !tFunctor.OnOverlap ( m_iLastStart, iLen, -1 );
+					m_iLastStart += iLen;
+				}
+				break;
+
+			case TYPE_SPZ:
+				{
+					m_iReadPtr++;
+					assert ( m_pZoneInfo );
+
+					BYTE uSPZ = (BYTE)UnzipInt ();
+					DWORD uPosition = UnzipInt ();
+					DWORD uFlag = UnzipInt ();
+					int iZone = -1;
+					if ( uFlag==1 )
+						iZone = UnzipInt ();
+
+					const char * szZoneName = NULL;
+					if ( iZone!=-1 )
+					{
+						// fixme: it can be a lot faster
+						m_pZoneInfo->m_hZones.IterateStart();
+						while ( m_pZoneInfo->m_hZones.IterateNext () )
+							if ( m_pZoneInfo->m_hZones.IterateGet()==iZone )
+							{
+								szZoneName = m_pZoneInfo->m_hZones.IterateGetKey().cstr();
+								break;
+							}
+					}
+
+					tFunctor.OnSPZ ( uSPZ, uPosition, szZoneName, iZone );
+				}
+				break;
+
+			case TYPE_TAIL:
+				{
+					m_iReadPtr++;
+					DWORD uStart = UnzipInt ();
+					DWORD uLen = UnzipInt ();
+					DWORD uFlag = UnzipInt ();
+					int iBoundary = -1;
+					if ( uFlag==1 )
+						iBoundary = UnzipInt ();
+
+					tFunctor.OnTail ( uStart, uLen, iBoundary );
+				}
+				break;
+
+			default:
+				assert ( 0 && "INTERNAL ERROR: unhandled type in token cache" );
+				bStop = true;
+				break;
+			}
+
+			if ( bStop )
+				break;
+		}
+
+		tFunctor.OnFinish();
+	}
+
+private:
+	inline void ZipInt ( DWORD uValue )
+	{
+		int iBytes = 1;
+
+		DWORD u = ( uValue>>7 );
+		while ( u )
+		{
+			u >>= 7;
+			iBytes++;
+		}
+
+		while ( iBytes-- )
+		{
+			int iData = ( 0x7f & ( uValue >> (7*iBytes) ) ) | ( iBytes ? 0x80 : 0 );
+			m_dTokenStream.Add ( BYTE ( iData & 0xff ) );
+		}
+	}
+
+	inline DWORD UnzipInt()
+	{
+		DWORD uByte = m_dTokenStream[m_iReadPtr++];
+		DWORD uRes = 0;
+		while ( uByte & 0x80 )
+		{
+			uRes = ( uRes<<7 ) + ( uByte & 0x7f );
+			uByte = m_dTokenStream[m_iReadPtr++];
+		}
+
+		uRes = ( uRes<<7 ) + uByte;
+
+		return uRes;
+	}
 };
 
 
@@ -2158,36 +1137,61 @@ public:
 class HitCollector_c : public TokenFunctorTraits_c
 {
 public:
-	mutable BYTE	m_sTmpWord [ 3*SPH_MAX_WORD_LEN + 16 ];
-	SphWordID_t		m_uSentenceID;
-	SphWordID_t		m_uParagraphID;
+	mutable BYTE		m_sTmpWord [ 3*SPH_MAX_WORD_LEN + 16 ];
+	SphWordID_t			m_uSentenceID;
+	SphWordID_t			m_uParagraphID;
+	DWORD				m_uFoundWords;
+	CacheStreamer_c &	m_tTokenContainer;
 
 public:
-	explicit HitCollector_c ( SnippetsDocIndex_c & tContainer, ISphTokenizer * pTokenizer, CSphDict * pDict, const ExcerptQuery_t & tQuery, const CSphIndexSettings & tSettingsIndex, const char * sDoc, int iDocLen )
+	explicit HitCollector_c ( SnippetsDocIndex_c & tContainer, ISphTokenizer * pTokenizer,
+		CSphDict * pDict, const ExcerptQuery_t & tQuery, const CSphIndexSettings & tSettingsIndex,
+		const char * sDoc, int iDocLen, CacheStreamer_c & tTokenContainer )
 		: TokenFunctorTraits_c ( tContainer, pTokenizer, pDict, tQuery, tSettingsIndex, sDoc, iDocLen )
+		, m_uFoundWords ( 0 )
+		, m_tTokenContainer ( tTokenContainer )
 	{
 		strncpy ( (char *)m_sTmpWord, MAGIC_WORD_SENTENCE, sizeof(m_sTmpWord) );
 		m_uSentenceID = pDict->GetWordID ( m_sTmpWord );
 		strncpy ( (char *)m_sTmpWord, MAGIC_WORD_PARAGRAPH, sizeof(m_sTmpWord) );
 		m_uParagraphID = pDict->GetWordID ( m_sTmpWord );
 		m_tContainer.SetupHits();
+
+		m_bCollectExtraZoneInfo = true;
 	}
 
-	virtual ~HitCollector_c () {}
-
-	virtual void OnToken ( int, int iLen, const BYTE * sWord, DWORD uPosition, const CSphVector<SphWordID_t> & dWordids )
+	bool OnToken ( TokenInfo_t & tTok, const CSphVector<SphWordID_t> & dTokens )
 	{
 		bool bReal = false;
-		ARRAY_FOREACH ( i, dWordids )
-			if ( dWordids[i] )
+		if ( tTok.m_uWordId )
 		{
-			m_tContainer.AddHits ( dWordids[i], sWord, iLen, uPosition );
+			m_tContainer.AddHits ( tTok.m_uWordId, tTok.m_sWord, tTok.m_iLen, tTok.m_uPosition );
 			bReal = true;
 		}
-		m_tContainer.m_uLastPos = bReal ? uPosition : m_tContainer.m_uLastPos;
+		ARRAY_FOREACH ( i, dTokens )
+		{
+			if ( dTokens[i] )
+			{
+				m_tContainer.AddHits ( dTokens[i], tTok.m_sWord, tTok.m_iLen, tTok.m_uPosition );
+				bReal = true;
+			}
+		}
+
+		m_tContainer.m_uLastPos = bReal ? tTok.m_uPosition : m_tContainer.m_uLastPos;
+
+		int iTermIndex = m_tContainer.FindWord ( tTok.m_uWordId, tTok.m_sWord, tTok.m_iLen );
+		ARRAY_FOREACH_COND ( i, dTokens, iTermIndex==-1 )
+			iTermIndex = m_tContainer.FindWord ( dTokens[i], NULL, 0 );
+
+		m_uFoundWords |= iTermIndex==-1 ? 0 : 1 << iTermIndex;
+		tTok.m_iTermIndex = iTermIndex;
+
+		m_tTokenContainer.StoreToken ( tTok );
+
+		return true;
 	}
 
-	virtual void OnSPZ ( BYTE iSPZ, DWORD uPosition, char * sZoneName )
+	void OnSPZ ( BYTE iSPZ, DWORD uPosition, const char * sZoneName, int iZone )
 	{
 		switch ( iSPZ )
 		{
@@ -2208,15 +1212,16 @@ public:
 		}
 
 		m_tContainer.m_uLastPos = uPosition;
+
+		m_tTokenContainer.StoreSPZ ( iSPZ, uPosition, sZoneName, iZone );
 	}
 
-	virtual const CSphVector<int> * GetHitlist ( const XQKeyword_t & tWord ) const
+	const CSphVector<int> * GetHitlist ( const XQKeyword_t & tWord ) const
 	{
 		int iWord = -1;
-		if ( tWord.m_uStarPosition )
-		{
-			iWord = m_tContainer.FindWord ( 0, (const BYTE *)tWord.m_sWord.cstr(), tWord.m_sWord.Length() );
-		} else
+		if ( HasStars ( tWord ) )
+			iWord = m_tContainer.FindStarred ( tWord.m_sWord.cstr() );
+		else
 		{
 			strncpy ( (char *)m_sTmpWord, tWord.m_sWord.cstr(), sizeof(m_sTmpWord) );
 			SphWordID_t iWordID = m_pDict->GetWordID ( m_sTmpWord );
@@ -2230,10 +1235,23 @@ public:
 			return NULL;
 	}
 
-	virtual void OnOverlap ( int, int ) {}
-	virtual void OnSkipHtml ( int, int ) {}
-	virtual void OnTail ( int, int ) {}
-	virtual void OnFinish () {}
+	bool OnOverlap ( int iStart, int iLen, int iBoundary )
+	{
+		m_tTokenContainer.StoreOverlap ( iStart, iLen, iBoundary );
+		return true;
+	}
+
+	void OnSkipHtml ( int iStart, int iLen )
+	{
+		m_tTokenContainer.StoreSkipHtml ( iStart, iLen );
+	}
+
+	void OnTail ( int iStart, int iLen, int iBoundary )
+	{
+		m_tTokenContainer.StoreTail ( iStart, iLen, iBoundary );
+	}
+
+	void OnFinish () {}
 };
 
 
@@ -2247,104 +1265,1549 @@ protected:
 	int		m_iAfterPostLen;
 
 public:
-	HighlightPlain_c ( SnippetsDocIndex_c & tContainer, ISphTokenizer * pTokenizer, CSphDict * pDict, const ExcerptQuery_t & tQuery, const CSphIndexSettings & tSettingsIndex, const char * sDoc, int iDocLen )
+	HighlightPlain_c ( SnippetsDocIndex_c & tContainer, ISphTokenizer * pTokenizer,
+		CSphDict * pDict, const ExcerptQuery_t & tQuery, const CSphIndexSettings & tSettingsIndex,
+		const char * sDoc, int iDocLen, int iReserveResult )
 		: TokenFunctorTraits_c ( tContainer, pTokenizer, pDict, tQuery, tSettingsIndex, sDoc, iDocLen )
 		, m_iBeforeLen ( tQuery.m_sBeforeMatch.Length() )
 		, m_iAfterLen ( tQuery.m_sAfterMatch.Length() )
 		, m_iBeforePostLen ( tQuery.m_sBeforeMatchPassage.Length() )
 		, m_iAfterPostLen ( tQuery.m_sAfterMatchPassage.Length() )
 	{
-		m_dResult.Reserve ( m_iDocLen );
+		m_dResult.Reserve ( iReserveResult );
 	}
 
-	virtual ~HighlightPlain_c () {}
-
-	virtual void OnOverlap ( int iStart, int iLen )
+	bool OnOverlap ( int iStart, int iLen, int )
 	{
 		assert ( m_pDoc );
-		assert ( iStart>=0 && m_pDoc+iStart+iLen<=m_pTokenizer->GetBufferEnd() );
+		assert ( iStart>=0 && m_pDoc+iStart+iLen<=m_pDocMax );
+		ResultEmit ( m_pDoc+iStart, iLen );
+		return true;
+	}
+
+	void OnSkipHtml ( int iStart, int iLen )
+	{
+		assert ( m_pDoc );
+		assert ( iStart>=0 && m_pDoc+iStart+iLen<=m_pDocMax );
 		ResultEmit ( m_pDoc+iStart, iLen );
 	}
 
-	virtual void OnSkipHtml ( int iStart, int iLen )
+	bool OnToken ( TokenInfo_t & tTok, const CSphVector<SphWordID_t> & dTokens )
 	{
 		assert ( m_pDoc );
-		assert ( iStart>=0 && m_pDoc+iStart+iLen<=m_pTokenizer->GetBufferEnd() );
-		ResultEmit ( m_pDoc+iStart, iLen );
-	}
+		assert ( tTok.m_iStart>=0 && m_pDoc+tTok.m_iStart+tTok.m_iLen<=m_pDocMax );
 
-	virtual void OnToken ( int iStart, int iLen, const BYTE * sWord, DWORD, const CSphVector<SphWordID_t> & dWordids )
-	{
-		assert ( m_pDoc );
-		assert ( iStart>=0 && m_pDoc+iStart+iLen<=m_pTokenizer->GetBufferEnd() );
-
-		bool bMatch = m_tContainer.FindWord ( dWordids[0], sWord , iLen )!=-1; // the primary one; need this for star matching
-		for ( int i=1; i<dWordids.GetLength() && !bMatch; i++ )
-			if ( m_tContainer.FindWord ( dWordids[i], NULL, 0 )!=-1 )
-				bMatch = true;
+		bool bMatch = m_tContainer.FindWord ( tTok.m_uWordId, tTok.m_sWord , tTok.m_iLen )!=-1; // the primary one; need this for star matching
+		ARRAY_FOREACH_COND ( i, dTokens, !bMatch )
+			bMatch = ( m_tContainer.FindWord ( dTokens[i], NULL, 0 )!=-1 );
 
 		if ( bMatch )
-			ResultEmit ( m_sBeforeMatch.cstr(), m_iBeforeLen, m_bHasBeforePassageMacro, m_iPassageId, m_sBeforeMatchPassage.cstr(), m_iBeforePostLen );
+		{
+			ResultEmit ( m_sBeforeMatch.cstr(), m_iBeforeLen, m_bHasBeforePassageMacro,
+				m_iPassageId, m_sBeforeMatchPassage.cstr(), m_iBeforePostLen );
+			m_iMatchesCount++;
+		}
 
-		ResultEmit ( m_pDoc+iStart, iLen );
+		ResultEmit ( m_pDoc+tTok.m_iStart, tTok.m_iLen );
 
 		if ( bMatch )
-			ResultEmit ( m_sAfterMatch.cstr(), m_iAfterLen, m_bHasAfterPassageMacro, m_iPassageId++, m_sAfterMatchPassage.cstr(), m_iAfterPostLen );
+			ResultEmit ( m_sAfterMatch.cstr(), m_iAfterLen, m_bHasAfterPassageMacro,
+				m_iPassageId++, m_sAfterMatchPassage.cstr(), m_iAfterPostLen );
+
+		return true;
 	}
 
-	virtual void OnSPZ ( BYTE , DWORD, char * ) {}
+	void OnSPZ ( BYTE , DWORD, const char *, int ) {}
 
-	virtual void OnTail ( int iStart, int iLen )
+	void OnTail ( int iStart, int iLen, int )
 	{
 		assert ( m_pDoc );
-		assert ( iStart>=0 && m_pDoc+iStart+iLen<=m_pTokenizer->GetBufferEnd() );
+		assert ( iStart>=0 && m_pDoc+iStart+iLen<=m_pDocMax );
 		ResultEmit ( m_pDoc+iStart, iLen );
 	}
 
-	virtual void OnFinish () {}
-
-	virtual const CSphVector<int> * GetHitlist ( const XQKeyword_t & ) const
-	{
-		return NULL;
-	}
+	void OnFinish () {}
+	const CSphVector<int> * GetHitlist ( const XQKeyword_t & ) const { return NULL;	}
 };
+
+
+static int EstimateResult ( const ExcerptQuery_t & q, int iDocLen )
+{
+	if ( q.m_iLimit>0 )
+		return 2*q.m_iLimit;
+	if ( q.m_iLimitPassages )
+		return 256*q.m_iLimitPassages;
+	if ( q.m_iLimitWords )
+		return 16*q.m_iLimitWords;
+	return iDocLen;
+}
 
 
 /// functor that matches tokens against hit positions from mini-index and highlights them
 class HighlightQuery_c : public HighlightPlain_c
 {
 public:
-	const SphHitMark_t * m_pHit;
-	const SphHitMark_t * m_pHitEnd;
+	const SphHitMark_t *	m_pHit;
+	const SphHitMark_t *	m_pHitEnd;
+	int						m_iOpenTill; // blend-chars has same positions as blend-part tokens
+	int						m_iLastPos;
 
 public:
-	HighlightQuery_c ( SnippetsDocIndex_c & tContainer, ISphTokenizer * pTokenizer, CSphDict * pDict, const ExcerptQuery_t & tQuery, const CSphIndexSettings & tSettingsIndex, const char * sDoc, int iDocLen, const CSphVector<SphHitMark_t> & dHits )
-		: HighlightPlain_c ( tContainer, pTokenizer, pDict, tQuery, tSettingsIndex, sDoc, iDocLen )
+	HighlightQuery_c ( SnippetsDocIndex_c & tContainer, ISphTokenizer * pTokenizer, CSphDict * pDict,
+		const ExcerptQuery_t & tQuery, const CSphIndexSettings & tSettingsIndex,
+		const char * sDoc, int iDocLen, const CSphVector<SphHitMark_t> & dHits )
+		: HighlightPlain_c ( tContainer, pTokenizer, pDict, tQuery, tSettingsIndex, sDoc, iDocLen, EstimateResult ( tQuery, iDocLen ) )
 		, m_pHit ( dHits.Begin() )
 		, m_pHitEnd ( dHits.Begin()+dHits.GetLength() )
+		, m_iOpenTill ( 0 )
+		, m_iLastPos ( 0 )
 	{}
 
-	virtual ~HighlightQuery_c () {}
-
-	virtual void OnToken ( int iStart, int iLen, const BYTE *, DWORD uPosition, const CSphVector<SphWordID_t> & )
+	bool OnToken ( TokenInfo_t & tTok, const CSphVector<SphWordID_t> & )
 	{
 		assert ( m_pDoc );
-		assert ( iStart>=0 && m_pDoc+iStart+iLen<=m_pTokenizer->GetBufferEnd() );
+		assert ( tTok.m_iStart>=0 && m_pDoc+tTok.m_iStart+tTok.m_iLen<=m_pDocMax );
 
 		// fast forward until next potentially matching hit (hits are sorted by position)
-		while ( m_pHit<m_pHitEnd && m_pHit->m_uPosition+m_pHit->m_uSpan<=uPosition )
+		while ( m_pHit<m_pHitEnd && m_pHit->m_uPosition+m_pHit->m_uSpan<=tTok.m_uPosition )
 			m_pHit++;
 
+		CheckClose ( tTok.m_uPosition );
+
 		// marker folding, emit "before" marker at span start only
-		if ( m_pHit<m_pHitEnd && uPosition==m_pHit->m_uPosition )
-			ResultEmit ( m_sBeforeMatch.cstr(), m_iBeforeLen, m_bHasBeforePassageMacro, m_iPassageId, m_sBeforeMatchPassage.cstr(), m_iBeforePostLen );
+		if ( m_pHit<m_pHitEnd && tTok.m_uPosition==m_pHit->m_uPosition && !m_iOpenTill )
+		{
+			ResultEmit ( m_sBeforeMatch.cstr(), m_iBeforeLen, m_bHasBeforePassageMacro,
+				m_iPassageId, m_sBeforeMatchPassage.cstr(), m_iBeforePostLen );
+			m_iMatchesCount++;
+			m_iOpenTill = m_pHit->m_uPosition+m_pHit->m_uSpan;
+		}
 
 		// emit token itself
-		ResultEmit ( m_pDoc+iStart, iLen );
+		ResultEmit ( m_pDoc+tTok.m_iStart, tTok.m_iLen );
+		m_iLastPos = tTok.m_uPosition;
+		return true;
+	}
 
+	void OnTail ( int iStart, int iLen, int )
+	{
+		assert ( m_pDoc );
+		assert ( iStart>=0 && m_pDoc+iStart+iLen<=m_pDocMax );
+		CheckClose ( m_iLastPos+1 );
+		ResultEmit ( m_pDoc+iStart, iLen );
+	}
+
+	void OnFinish ()
+	{
+		if ( !m_iOpenTill )
+			return;
+		ResultEmit ( m_sAfterMatch.cstr(), m_iAfterLen, m_bHasAfterPassageMacro, m_iPassageId++, m_sAfterMatchPassage.cstr(), m_iAfterPostLen );
+	}
+
+	bool OnOverlap ( int iStart, int iLen, int )
+	{
+		assert ( m_pDoc );
+		assert ( iStart>=0 && m_pDoc+iStart+iLen<=m_pDocMax );
+		CheckClose ( m_iLastPos+1 );
+		ResultEmit ( m_pDoc+iStart, iLen );
+		return true;
+	}
+
+	void OnSkipHtml ( int iStart, int iLen )
+	{
+		assert ( m_pDoc );
+		assert ( iStart>=0 && m_pDoc+iStart+iLen<=m_pDocMax );
+		CheckClose ( m_iLastPos+1 );
+		ResultEmit ( m_pDoc+iStart, iLen );
+	}
+
+private:
+	void CheckClose ( int iPos )
+	{
 		// marker folding, emit "after" marker at span end only
-		if ( m_pHit<m_pHitEnd && uPosition==m_pHit->m_uPosition+m_pHit->m_uSpan-1 )
-			ResultEmit ( m_sAfterMatch.cstr(), m_iAfterLen, m_bHasAfterPassageMacro, m_iPassageId++, m_sAfterMatchPassage.cstr(), m_iAfterPostLen );
+		if ( !m_iOpenTill || iPos<m_iOpenTill )
+			return;
+
+		ResultEmit ( m_sAfterMatch.cstr(), m_iAfterLen, m_bHasAfterPassageMacro, m_iPassageId++, m_sAfterMatchPassage.cstr(), m_iAfterPostLen );
+		m_iOpenTill = 0;
+	}
+};
+
+
+struct StoredExcerptToken_t
+{
+	int				m_iLengthCP;
+	BYTE			m_iWordFlag;
+};
+
+struct Passage_t
+{
+	int					m_iStart;			///< start token index
+	int					m_iTokens;			///< token count
+	int					m_iCodes;			///< codepoints count
+	int					m_iWords;			///< words count
+	DWORD				m_uQwords;			///< matching query words mask
+	int					m_iQwordsWeight;	///< passage weight factor
+	int					m_iQwordCount;		///< passage weight factor
+	int					m_iUniqQwords;		///< passage weight factor
+	int					m_iMaxLCS;			///< passage weight factor
+	int					m_iMinGap;			///< passage weight factor
+	int					m_iStartLimit;		///< start of match in passage
+	int					m_iEndLimit;		///< end of match in passage
+	int					m_iAroundBefore;	///< words before first matched words
+	int					m_iAroundAfter;		///< words after last matched words
+	int					m_iCodesBetweenKeywords;	///< codepoints between m_iStartLimit and m_iEndLimit
+	int					m_iWordsBetweenKeywords;	///< words between m_iStartLimit and m_iEndLimit
+
+	CSphVector<StoredExcerptToken_t> m_dBeforeTokens;	///< stored tokens before match
+	CSphVector<StoredExcerptToken_t> m_dAfterTokens;	///< stored tokens after match
+
+	void Reset ()
+	{
+		m_iStart = 0;
+		m_iTokens = 0;
+		m_iCodes = 0;
+		m_uQwords = 0;
+		m_iQwordsWeight = 0;
+		m_iQwordCount = 0;
+		m_iUniqQwords = 0;
+		m_iMaxLCS = 0;
+		m_iMinGap = 0;
+		m_iAroundBefore = 0;
+		m_iAroundAfter = 0;
+		m_iCodesBetweenKeywords = 0;
+		m_iWordsBetweenKeywords = 0;
+		m_dBeforeTokens.Resize(0);
+		m_dAfterTokens.Resize(0);
+	}
+
+	void CopyData ( Passage_t & tPassage )
+	{
+		m_iStart = tPassage.m_iStart;
+		m_iTokens = tPassage.m_iTokens;
+		m_iCodes = tPassage.m_iCodes;
+		m_iWords = tPassage.m_iWords;
+		m_uQwords = tPassage.m_uQwords;
+		m_iQwordsWeight = tPassage.m_iQwordsWeight;
+		m_iQwordCount = tPassage.m_iQwordCount;
+		m_iUniqQwords = tPassage.m_iUniqQwords;
+		m_iMaxLCS = tPassage.m_iMaxLCS;
+		m_iMinGap = tPassage.m_iMinGap;
+		m_iStartLimit = tPassage.m_iStartLimit;
+		m_iEndLimit = tPassage.m_iEndLimit;
+		m_iAroundBefore = tPassage.m_iAroundBefore;
+		m_iAroundAfter = tPassage.m_iAroundAfter;
+		m_iCodesBetweenKeywords = tPassage.m_iCodesBetweenKeywords;
+		m_iWordsBetweenKeywords = tPassage.m_iWordsBetweenKeywords;
+		m_dBeforeTokens.SwapData ( tPassage.m_dBeforeTokens );
+		m_dAfterTokens.SwapData ( tPassage.m_dAfterTokens );
+	}
+
+	inline int GetWeight () const
+	{
+		return m_iQwordCount + m_iQwordsWeight*m_iMaxLCS + m_iMinGap;
+	}
+};
+
+
+inline bool operator < ( const Passage_t & a, const Passage_t & b )
+{
+	if ( a.m_iUniqQwords==b.m_iUniqQwords )
+	{
+		int iWeightA = a.GetWeight();
+		int iWeightB = b.GetWeight();
+
+		return iWeightA==iWeightB ? a.m_iCodes < b.m_iCodes : iWeightA < iWeightB;
+	} else
+		return a.m_iUniqQwords < b.m_iUniqQwords;
+}
+
+
+struct PassagePositionOrder_fn
+{
+	inline bool IsLess ( const Passage_t & a, const Passage_t & b ) const
+	{
+		return a.m_iStart < b.m_iStart;
+	}
+};
+
+
+struct SpanToken_t
+{
+	DWORD				m_uQwordMask;		///< query words mask
+	int					m_iLengthCP;		///< token length in codepoints
+	BYTE				m_iWordFlag;		///< token type
+};
+
+
+struct Space_t
+{
+	int					m_iStartBytes;		///< offset from doc start
+	int					m_iLengthBytes;		///< length in bytes
+	int					m_iLengthCP;		///< length in codepoints
+};
+
+
+struct TokenSpan_t
+{
+public:
+	int		m_iStart;	///< starting token
+	int		m_iWords;	///< number of TOK_WORDS tokens
+	int		m_iQwords;	///< number of words matching query
+	int		m_iCodes;	///< total length in codepoints (cached)
+
+private:
+	int		m_iStartIndex;
+	int		m_iNumTokens;
+	int		m_iBufferBits;	///< log2(m_dTokens.GetLength())
+	DWORD	m_uBufferMask;
+
+	CSphTightVector<SpanToken_t>	m_dTokens;
+
+public:
+	void Init ( int nStoredTokens )
+	{
+		m_iBufferBits = sphLog2 ( nStoredTokens-1 );
+		m_uBufferMask = ( 1<<m_iBufferBits )-1;
+		m_dTokens.Resize ( 1<<m_iBufferBits );
+		Reset ();
+	}
+
+	void Reset ()
+	{
+		m_iStart = -1;
+		m_iWords = 0;
+		m_iQwords = 0;
+		m_iCodes = 0;
+		m_iStartIndex = 0;
+		m_iNumTokens = 0;
+	}
+
+	void ScaleUp()
+	{
+		// not enough preallocated tokens, realloc
+		CSphTightVector<SpanToken_t> dNewTokens;
+		dNewTokens.Resize ( m_dTokens.GetLength()*2 );
+
+		for ( int i=0; i<m_iNumTokens; i++ )
+			dNewTokens[i] = GetToken(i);
+		dNewTokens.SwapData ( m_dTokens );
+
+		m_iBufferBits++;
+		m_uBufferMask = ( 1<<m_iBufferBits )-1;
+
+		m_iStartIndex = 0;
+	}
+
+	void Add ( int iToken, bool bWordFlag, bool bQWord, int iTermIndex, int iLengthCP )
+	{
+		bQWord &= bWordFlag;
+
+		if ( m_iNumTokens==m_dTokens.GetLength() )
+			ScaleUp();
+
+		int iEndIndex = ( m_iStartIndex + m_iNumTokens ) & m_uBufferMask;
+		m_iNumTokens++;
+
+		SpanToken_t & tToken = m_dTokens [ iEndIndex ];
+		tToken.m_uQwordMask = ( bQWord && ( iTermIndex>=0 ) ) ? ( 1<<iTermIndex ) : 0;
+		tToken.m_iLengthCP = iLengthCP;
+		tToken.m_iWordFlag = bWordFlag;
+
+		m_iCodes += iLengthCP;
+		m_iWords += bWordFlag;
+		m_iQwords += bQWord;
+
+		if ( m_iStart<0 )
+			m_iStart = iToken;
+	}
+
+	int GetNumTokens () const
+	{
+		return m_iNumTokens;
+	}
+
+	const SpanToken_t & GetToken ( int iToken ) const
+	{
+		assert ( iToken<=m_iNumTokens );
+		int iIndex = ( m_iStartIndex + iToken ) & m_uBufferMask;
+		return m_dTokens[iIndex];
+	}
+
+	void RemoveStartingTokens ( int nTokens )
+	{
+		assert ( nTokens<m_iNumTokens );
+		m_iStartIndex = ( m_iStartIndex + nTokens ) & m_uBufferMask;
+		m_iNumTokens -= nTokens;
+	}
+};
+
+
+static void SplitSpaceIntoTokens ( CSphVector<Space_t> & dSpaces, const char * pDoc, int iStart, int iLen, int iBoundary = -1 )
+{
+	// most frequent case
+	if ( sphIsSpace ( pDoc[iStart] ) && iLen==1 )
+	{
+		dSpaces.Resize(1);
+		dSpaces[0].m_iStartBytes = iStart;
+		dSpaces[0].m_iLengthBytes = 1;
+		dSpaces[0].m_iLengthCP = 1;
+		return;
+	}
+
+	dSpaces.Resize(0);
+
+	int iGapStart = iStart;
+	bool bWasSpace = sphIsSpace ( *(pDoc+iStart) );
+	bool bWasBoundary = iBoundary==iStart;
+
+	for ( int i=iStart; i<iStart+iLen; i++ )
+	{
+		bool bSpace = sphIsSpace ( *(pDoc+i) );
+		bool bBoundary = i==iBoundary;
+		if ( bSpace!=bWasSpace || bBoundary!=bWasBoundary )
+		{
+			Space_t & tLastSpace = dSpaces.Add();
+			tLastSpace.m_iStartBytes = iGapStart;
+			tLastSpace.m_iLengthBytes = i-iGapStart;
+			tLastSpace.m_iLengthCP = sphUTF8Len ( pDoc+tLastSpace.m_iStartBytes, tLastSpace.m_iLengthBytes );
+
+			bWasSpace = bSpace;
+			bWasBoundary = bBoundary;
+			iGapStart = i;
+		}
+	}
+
+	if ( iGapStart < iStart+iLen )
+	{
+		Space_t & tLastSpace = dSpaces.Add();
+		tLastSpace.m_iStartBytes = iGapStart;
+		tLastSpace.m_iLengthBytes = iStart+iLen-iGapStart;
+		tLastSpace.m_iLengthCP = sphUTF8Len ( pDoc+tLastSpace.m_iStartBytes, tLastSpace.m_iLengthBytes );
+	}
+}
+
+
+// passage collecting functor traits
+class PassageCollectorTraits_c : public TokenFunctorTraits_c
+{
+public:
+	bool					m_bFixedWeightOrder;
+	CSphVector<Passage_t>	m_dPassages;
+	CSphVector<BYTE>		m_dStartResult;
+	CSphVector<SphHitMark_t>m_dCollectedHits;
+	DWORD					m_uFoundWords;
+
+	int						m_iThresh;
+	DWORD					m_uPassagesQwords;
+	int						m_dQwordWeights[32];
+	CSphVector<int>			m_dTopPassageWeights;
+
+protected:
+	const SphHitMark_t *	m_pHit;
+	const SphHitMark_t *	m_pHitEnd;
+	TokenSpan_t				m_tSpan;
+	Passage_t				m_tPass;
+	int						m_iCurToken;
+	bool					m_bCollectionStopped;
+	CSphVector<Space_t>		m_dSpaces;
+	int						m_iResultLenCP;
+
+
+	PassageCollectorTraits_c ( SnippetsDocIndex_c & tContainer, ISphTokenizer * pTokenizer, CSphDict * pDict, const ExcerptQuery_t & tQuery, const CSphIndexSettings & tSettingsIndex, const char * sDoc, int iDocLen, const CSphVector<SphHitMark_t> * dHits )
+		: TokenFunctorTraits_c ( tContainer, pTokenizer, pDict, tQuery, tSettingsIndex, sDoc, iDocLen )
+		, m_bFixedWeightOrder ( m_bWeightOrder )
+		, m_uFoundWords	( 0 )
+		, m_iThresh ( 0 )
+		, m_uPassagesQwords ( 0 )
+		, m_pHit ( dHits ? dHits->Begin() : NULL )
+		, m_pHitEnd ( dHits ? dHits->Begin()+dHits->GetLength() : NULL )
+		, m_iCurToken ( 0 )
+		, m_bCollectionStopped ( false )
+		, m_iResultLenCP ( 0 )
+	{
+		const int AVG_WORD_LEN = 5;
+		int iSpanSize = m_iLimit ? 8*m_iLimit/AVG_WORD_LEN : 2*m_iLimitWords;
+		if ( !iSpanSize )
+			iSpanSize = 128;
+
+		m_tSpan.Init ( iSpanSize );
+		m_tPass.Reset();
+		m_dPassages.Reserve(1024);
+
+		if ( !dHits )
+			m_dCollectedHits.Reserve(4096);
+
+		if ( tQuery.m_iLimitPassages>0 )
+			m_iThresh = tQuery.m_iLimitPassages;
+		else if ( tQuery.m_iLimitWords>0 )
+			m_iThresh = tQuery.m_iLimitWords / 2;
+		else if ( tQuery.m_iLimit>0 )
+			m_iThresh = tQuery.m_iLimit / 4;
+
+		m_iThresh = 1 << sphLog2 ( m_iThresh );
+
+		memset ( m_dQwordWeights, 0, sizeof(m_dQwordWeights) );
+	}
+
+	void CollectStartTokens ( int iStart, int iLen, int iLenghCP = -1 )
+	{
+		if ( m_bAllowEmpty || m_bCollectionStopped )
+			return;
+
+		int iCalcLengthCP = iLenghCP;
+		if ( iCalcLengthCP==-1 )
+			iCalcLengthCP = sphUTF8Len ( m_pDoc+iStart, iLen );
+
+		bool bLengthOk = m_iResultLenCP+iCalcLengthCP<=m_iLimit;
+		if ( bLengthOk || !m_dStartResult.GetLength() )
+		{
+			ResultEmit ( m_dStartResult, m_pDoc+iStart, iLen );
+			m_iResultLenCP += iCalcLengthCP;
+		}
+
+		if ( !bLengthOk )
+		{
+			ResultEmit ( m_dStartResult, m_sChunkSeparator.cstr(), m_sChunkSeparator.Length() );
+			m_bCollectionStopped = true;
+		}
+	}
+
+	void CollectStartSpaces ()
+	{
+		if ( m_bAllowEmpty || m_bCollectionStopped )
+			return;
+
+		ARRAY_FOREACH_COND ( i, m_dSpaces, !m_bCollectionStopped )
+		{
+			Space_t & tSpace = m_dSpaces[i];
+			CollectStartTokens ( tSpace.m_iStartBytes, tSpace.m_iLengthBytes, tSpace.m_iLengthCP );
+		}
+	}
+
+	void CalcPassageWeight ( int iMaxWords )
+	{
+		DWORD uLast = 0;
+		int iLCS = 1;
+
+		m_tPass.m_iMaxLCS = 1;
+		m_tPass.m_uQwords = 0;
+		m_tPass.m_iMinGap = iMaxWords-1;
+		m_tPass.m_iStartLimit = INT_MAX;
+		m_tPass.m_iEndLimit = INT_MIN;
+		m_tPass.m_iAroundBefore = m_tPass.m_iAroundAfter = 0;
+		m_tPass.m_iQwordCount = 0;
+		m_tPass.m_iUniqQwords = 0;
+		m_tPass.m_iQwordsWeight = 0;
+
+		int iWord = -1;
+		for ( int i = 0; i < m_tSpan.GetNumTokens(); i++ )
+		{
+			const SpanToken_t & tTok = m_tSpan.GetToken(i);
+			if ( !tTok.m_iWordFlag )
+				continue;
+			iWord++;
+
+			// update mask
+			m_tPass.m_uQwords |= tTok.m_uQwordMask;
+
+			// update match boundary
+			if ( tTok.m_uQwordMask )
+			{
+				int iTok = m_tSpan.m_iStart+i;
+				m_tPass.m_iStartLimit = Min ( m_tPass.m_iStartLimit, iTok );
+				m_tPass.m_iEndLimit = Max ( m_tPass.m_iEndLimit, iTok );
+				m_tPass.m_iQwordCount++;
+			}
+
+			// update LCS
+			uLast = tTok.m_uQwordMask & ( uLast<<1 );
+			if ( uLast )
+			{
+				iLCS++;
+				m_tPass.m_iMaxLCS = Max ( iLCS, m_tPass.m_iMaxLCS );
+			} else
+			{
+				iLCS = 1;
+				uLast = tTok.m_uQwordMask;
+			}
+
+			// update min gap
+			if ( tTok.m_uQwordMask )
+			{
+				m_tPass.m_iMinGap = Min ( m_tPass.m_iMinGap, iWord );
+				m_tPass.m_iMinGap = Min ( m_tPass.m_iMinGap, m_tSpan.m_iWords-1-iWord );
+			}
+
+			m_tPass.m_iAroundBefore += ( m_tPass.m_uQwords==0 );
+			m_tPass.m_iAroundAfter = (tTok.m_uQwordMask ? 0 : m_tPass.m_iAroundAfter+1 );
+		}
+		assert ( m_tPass.m_iMinGap>=0 );
+		assert ( m_tSpan.m_iWords==iWord+1 );
+
+		// we do it only once because we don't need duplicate weights
+		// but m_iQwordCount will still show the total amount of qwords w/dupes
+		DWORD uWords = m_tPass.m_uQwords;
+		for ( iWord=0; uWords; uWords >>= 1, iWord++ )
+			if ( uWords & 1 )
+			{
+				m_tPass.m_iQwordsWeight += m_tContainer.GetTermWeight(iWord);
+				m_tPass.m_iUniqQwords++;
+			}
+
+		// total number of words is important too, so lets boost it a bit
+		m_tPass.m_iQwordCount *= 2;
+	}
+
+	void AppendBeforeAfterTokens ( Passage_t & tPassage, const TokenSpan_t & tSpan )
+	{
+		// maybe we don't need no extra token info
+		if ( ( ( m_iLimit==0 || m_iLimit>=m_iDocLen ) && !m_iLimitWords && m_ePassageSPZ==SPH_SPZ_NONE ) || m_bUseBoundaries )
+			return;
+
+		tPassage.m_iCodesBetweenKeywords = tPassage.m_iCodes;
+		tPassage.m_iWordsBetweenKeywords = tPassage.m_iWords;
+
+		tPassage.m_dBeforeTokens.Resize(0);
+		tPassage.m_dAfterTokens.Resize(0);
+
+		tPassage.m_dBeforeTokens.Reserve ( (m_iAround+1)*2 );
+		tPassage.m_dAfterTokens.Reserve ( (m_iAround+1)*2 );
+
+		int iBefore = 0;
+		for ( int i = tPassage.m_iStartLimit-tSpan.m_iStart-1; i>=tPassage.m_iStart-m_tSpan.m_iStart; i-- )
+		{
+			const SpanToken_t & tTok = tSpan.GetToken(i);
+
+			tPassage.m_iCodesBetweenKeywords -= tTok.m_iLengthCP;
+			tPassage.m_iWordsBetweenKeywords -= tTok.m_iWordFlag;
+
+			if ( iBefore+tTok.m_iWordFlag<=tPassage.m_iAroundBefore )
+			{
+				StoredExcerptToken_t & tBeforeToken = tPassage.m_dBeforeTokens.Add();
+				tBeforeToken.m_iWordFlag = tTok.m_iWordFlag;
+				tBeforeToken.m_iLengthCP = tTok.m_iLengthCP;
+				iBefore += tTok.m_iWordFlag;
+			} else
+				break;
+		}
+
+		int iAfter = 0;
+		for ( int i = tPassage.m_iEndLimit-tSpan.m_iStart+1; i < tPassage.m_iTokens; i++ )
+		{
+			const SpanToken_t & tTok = tSpan.GetToken(i);
+			BYTE iWordFlag = tSpan.GetToken(i).m_iWordFlag;
+
+			tPassage.m_iCodesBetweenKeywords -= tTok.m_iLengthCP;
+			tPassage.m_iWordsBetweenKeywords -= iWordFlag;
+
+			if ( iAfter+iWordFlag<=tPassage.m_iAroundAfter )
+			{
+				StoredExcerptToken_t & tAfterToken = tPassage.m_dAfterTokens.Add();
+				tAfterToken.m_iWordFlag = tTok.m_iWordFlag;
+				tAfterToken.m_iLengthCP = tTok.m_iLengthCP;
+				iAfter += iWordFlag;
+			} else
+				break;
+		}
+
+		assert ( tPassage.m_iWordsBetweenKeywords>0 && tPassage.m_iCodesBetweenKeywords>0 );
+	}
+
+	bool SelectBestPassages ( CSphVector<Passage_t> & dShow )
+	{
+		assert ( m_dPassages.GetLength() );
+
+		// our limits
+		int iMaxPassages = m_iLimitPassages
+			? Min ( m_dPassages.GetLength(), m_iLimitPassages )
+			: m_dPassages.GetLength();
+		int iMaxWords = m_iLimitWords ? m_iLimitWords : INT_MAX;
+		int iMaxCp = m_iLimit ? m_iLimit : INT_MAX;
+
+		DWORD uWords = 0; // mask of words in dShow so far
+		int iTotalCodes = 0;
+		int iTotalWords = 0;
+		int iTotalKeywordCodes = 0;
+		int iTotalKeywordWords = 0;
+
+		CSphVector<int> dWeights ( m_dPassages.GetLength() );
+		ARRAY_FOREACH ( i, m_dPassages )
+			dWeights[i] = m_dPassages[i].m_iQwordsWeight;
+
+		// collect enough best passages to show all keywords and max out the limits
+		// don't care much if we're going over limits in this loop, it will be tightened below
+		bool bAll = false;
+		while ( dShow.GetLength() < iMaxPassages )
+		{
+			// get next best passage
+			int iBest = -1;
+			ARRAY_FOREACH ( i, m_dPassages )
+			{
+				if ( m_dPassages[i].m_iCodes && ( iBest==-1 || m_dPassages[iBest] < m_dPassages[i] ) )
+					iBest = i;
+			}
+			if ( iBest<0 )
+				break;
+
+			Passage_t & tBest = m_dPassages[iBest];
+
+			// force_all_keywords passage may be very big, so let's allow to show one of them
+			if ( !m_bForceAllWords || dShow.GetLength() )
+				if ( iTotalKeywordCodes+tBest.m_iCodesBetweenKeywords>iMaxCp || iTotalKeywordWords+tBest.m_iWordsBetweenKeywords>iMaxWords )
+					break;
+
+			bool bFits = iTotalCodes+tBest.m_iCodes<=iMaxCp && iTotalWords+tBest.m_iWords<=iMaxWords;
+			if ( uWords==m_uFoundWords && !bFits )
+			{
+				// there might be just enough space to partially display this passage
+				if ( iTotalCodes+tBest.m_iCodesBetweenKeywords<=iMaxCp && iTotalWords+tBest.m_iWordsBetweenKeywords<=iMaxWords )
+				{
+					iTotalWords += tBest.m_iWords;
+					iTotalCodes += tBest.m_iCodes;
+					dShow.Add ( tBest );
+				}
+				break;
+			}
+
+			// save it, despite limits or whatever, we'll tighten everything in the loop below
+			dShow.Add ( tBest );
+			uWords |= tBest.m_uQwords;
+			iTotalKeywordWords += tBest.m_iWordsBetweenKeywords;
+			iTotalKeywordCodes += tBest.m_iCodesBetweenKeywords;
+			iTotalWords += tBest.m_iWords;
+			iTotalCodes += tBest.m_iCodes;
+			tBest.m_iCodes = 0; // no longer needed here, abusing to mark displayed passages
+
+			// we just managed to show all words? do one final re-weighting run
+			if ( !bAll && uWords==m_uFoundWords )
+			{
+				bAll = true;
+				ARRAY_FOREACH ( i, m_dPassages )
+					m_dPassages[i].m_iQwordsWeight = dWeights[i];
+			}
+
+			// if we're already showing all words, re-weighting is not needed any more
+			if ( bAll )
+				continue;
+
+			// re-weight passages, adjust for new mask of shown words
+			// FIXME! re-weighting doesn't change m_iQwordCount (and qwords could possibly be duplicated) and LCS
+			ARRAY_FOREACH ( i, m_dPassages )
+			{
+				if ( !m_dPassages[i].m_iCodes )
+					continue;
+				DWORD uMask = tBest.m_uQwords;
+				for ( int iWord=0; uMask; iWord++, uMask >>= 1 )
+					if ( ( uMask & 1 ) && ( m_dPassages[i].m_uQwords & ( 1UL<<iWord ) ) )
+					{
+						m_dPassages[i].m_iQwordsWeight -= m_tContainer.GetTermWeight(iWord);
+						m_dPassages[i].m_iQwordCount--; // doesn't account for dupes
+						m_dPassages[i].m_iUniqQwords--;
+					}
+
+				m_dPassages[i].m_uQwords &= ~uWords;
+			}
+		}
+
+		// if all passages won't fit into the limit, try to trim them a bit
+		//
+		// this step is skipped when use_boundaries is enabled, because
+		// each passage must be a separate sentence (delimited by
+		// boundaries) and we don't want to split them
+		if ( ( iTotalCodes > iMaxCp || iTotalWords > iMaxWords ) && !m_bUseBoundaries )
+		{
+			// trim passages
+			bool bFirst = true;
+			bool bDone = false;
+			int iCodes = iTotalCodes;
+			while ( !bDone )
+			{
+				// drop one token from each passage starting from the least relevant
+				for ( int i=dShow.GetLength(); i > 0; i-- )
+				{
+					Passage_t & tPassage = dShow[i-1];
+
+					if ( !tPassage.m_dBeforeTokens.GetLength() && !tPassage.m_dAfterTokens.GetLength() )
+						continue;
+
+					bool bDropFirst;
+					if ( tPassage.m_dBeforeTokens.GetLength() > tPassage.m_dAfterTokens.GetLength() )
+						bDropFirst = true;
+					else if ( tPassage.m_dBeforeTokens.GetLength() < tPassage.m_dAfterTokens.GetLength() )
+						bDropFirst = false;
+					else if ( !tPassage.m_dBeforeTokens.Last().m_iWordFlag && tPassage.m_dAfterTokens.Last().m_iWordFlag )
+						bDropFirst = true;
+					else if ( tPassage.m_dBeforeTokens.Last().m_iWordFlag && !tPassage.m_dAfterTokens.Last().m_iWordFlag )
+						bDropFirst = false;
+					else
+						bDropFirst = bFirst;
+
+					if ( bDropFirst )
+					{
+						// drop first
+						const StoredExcerptToken_t & tTok = tPassage.m_dBeforeTokens.Pop();
+						tPassage.m_iStart++;
+						tPassage.m_iTokens--;
+						tPassage.m_iCodes -= tTok.m_iLengthCP;
+						iTotalCodes -= tTok.m_iLengthCP;
+						iTotalWords -= tTok.m_iWordFlag;
+
+					} else
+					{
+						// drop last
+						const StoredExcerptToken_t & tTok = tPassage.m_dAfterTokens.Pop();
+						tPassage.m_iTokens--;
+						tPassage.m_iCodes -= tTok.m_iLengthCP;
+						iTotalCodes -= tTok.m_iLengthCP;
+						iTotalWords -= tTok.m_iWordFlag;
+					}
+
+					if ( iTotalCodes<=iMaxCp && iTotalWords<=iMaxWords )
+					{
+						bDone = true;
+						break;
+					}
+				}
+				if ( iTotalCodes==iCodes )
+					break; // couldn't reduce anything
+				iCodes = iTotalCodes;
+				bFirst = !bFirst;
+			}
+		}
+
+		// if passages still don't fit start dropping least significant ones, limit is sacred.
+		while ( ( iTotalCodes > iMaxCp || iTotalWords > iMaxWords ) && !m_bForceAllWords )
+		{
+			iTotalCodes -= dShow.Last().m_iCodes;
+			iTotalWords -= dShow.Last().m_iWords;
+			dShow.RemoveFast ( dShow.GetLength()-1 );
+		}
+
+		if ( !dShow.GetLength() )
+			return false;
+
+		bool bPreSorted = false;
+		if ( m_bWeightOrder )
+		{
+			// maybe the weight order is the same as position order?
+			bool bPositionOrder = true;
+			for ( int i = 1; i<dShow.GetLength() && bPositionOrder; i++ )
+				if ( dShow[i-1].m_iStart>dShow[i].m_iStart )
+					bPositionOrder = false;
+
+			bPreSorted = bPositionOrder;
+
+			if ( bPositionOrder )
+				m_bFixedWeightOrder = false;
+		}
+
+		// sort passages in the document order
+		if ( !bPreSorted )
+			dShow.Sort ( PassagePositionOrder_fn() );
+
+		return true;
+	}
+
+	void SubmitPassages()
+	{
+		if ( !m_dPassages.GetLength() )
+			return;
+
+		CSphVector<Passage_t> dPassagesToShow;
+		if ( SelectBestPassages ( dPassagesToShow ) )
+		{
+			ARRAY_FOREACH ( i, dPassagesToShow )
+			{
+				dPassagesToShow[i].m_dBeforeTokens.Reset();
+				dPassagesToShow[i].m_dAfterTokens.Reset();
+			}
+			m_dPassages = dPassagesToShow;
+
+		} else
+			m_dPassages.Resize(0);
+	}
+};
+
+
+/// functor that highlights the start of the document
+class DocStartHighlighter_c : public PassageCollectorTraits_c
+{
+public:
+	DocStartHighlighter_c ( SnippetsDocIndex_c & tContainer, ISphTokenizer * pTokenizer, CSphDict * pDict, const ExcerptQuery_t & tQuery, const CSphIndexSettings & tSettingsIndex, const char * sDoc, int iDocLen )
+		: PassageCollectorTraits_c ( tContainer, pTokenizer, pDict, tQuery, tSettingsIndex, sDoc, iDocLen, NULL )
+	{
+		assert ( !m_bAllowEmpty );
+	}
+
+	bool OnToken ( TokenInfo_t & tTok, const CSphVector<SphWordID_t> & )
+	{
+		CollectStartTokens ( tTok.m_iStart, tTok.m_iLen );
+		return !m_bCollectionStopped;
+	}
+
+	bool OnOverlap ( int iStart, int iLen, int )
+	{
+		SplitSpaceIntoTokens ( m_dSpaces, m_pDoc, iStart, iLen );
+		CollectStartSpaces ();
+		return !m_bCollectionStopped;
+	}
+
+	void OnTail ( int iStart, int iLen, int )
+	{
+		SplitSpaceIntoTokens ( m_dSpaces, m_pDoc, iStart, iLen );
+		CollectStartSpaces ();
+	}
+
+	void OnSkipHtml ( int, int ) {}
+	void OnSPZ ( BYTE, DWORD, const char *, int ) {}
+	void OnFinish () {}
+	const CSphVector<int> * GetHitlist ( const XQKeyword_t & ) const { return NULL; }
+};
+
+
+/// functor that extracts passages for further highlighting
+class ExtractExcerpts_c : public PassageCollectorTraits_c
+{
+public:
+	ExtractExcerpts_c ( SnippetsDocIndex_c & tContainer, ISphTokenizer * pTokenizer, CSphDict * pDict, const ExcerptQuery_t & tQuery, const CSphIndexSettings & tSettingsIndex, const char * sDoc, int iDocLen, const CSphVector<SphHitMark_t> * dHits,
+		CacheStreamer_c * pTokenContainer )
+		: PassageCollectorTraits_c ( tContainer, pTokenizer, pDict, tQuery, tSettingsIndex, sDoc, iDocLen, dHits )
+		, m_eState		( STATE_WINDOW_SETUP )
+		, m_bQwordsChanged ( true )
+		, m_bAppendSentenceEnd ( false )
+		, m_pTokenContainer ( pTokenContainer )
+	{
+	}
+
+	bool OnToken ( TokenInfo_t & tTok, const CSphVector<SphWordID_t> & dTokens )
+	{
+		assert ( m_pDoc );
+		assert ( tTok.m_iStart>=0 && m_pDoc+tTok.m_iStart+tTok.m_iLen<=m_pDocMax );
+
+		bool bQWord = false;
+		int iTermIndex = -1;
+		if ( m_pHit )
+		{
+			// this means we've collected hits beforehand
+			while ( m_pHit<m_pHitEnd && m_pHit->m_uPosition+m_pHit->m_uSpan<=tTok.m_uPosition )
+				m_pHit++;
+
+			if ( m_pHit<m_pHitEnd && tTok.m_uPosition>=m_pHit->m_uPosition && tTok.m_uPosition<=m_pHit->m_uPosition+m_pHit->m_uSpan )
+				bQWord = true;
+
+			iTermIndex = tTok.m_iTermIndex;
+		} else
+		{
+			// no collected hits beforehand
+			iTermIndex = m_tContainer.FindWord ( tTok.m_uWordId, tTok.m_sWord, tTok.m_iLen );
+			ARRAY_FOREACH_COND ( i, dTokens, iTermIndex==-1 )
+				iTermIndex = m_tContainer.FindWord ( dTokens[i], NULL, 0 );
+
+			bQWord = iTermIndex!=-1;
+			m_uFoundWords |= iTermIndex==-1 ? 0 : 1 << iTermIndex;
+
+			// collect hits now
+			if ( bQWord )
+			{
+				SphHitMark_t & tHit = m_dCollectedHits.Add();
+				tHit.m_uPosition = tTok.m_uPosition;
+				tHit.m_uSpan = 1;
+			}
+		}
+
+		int iLengthCP = sphUTF8Len ( m_pDoc+tTok.m_iStart, tTok.m_iLen );
+
+		switch ( m_eState )
+		{
+		case STATE_WINDOW_SETUP:
+			{
+				DWORD uAllQwords = ( 1 << m_tContainer.GetNumTerms() )-1;
+				const int iCpLimit = m_iLimit ? m_iLimit : INT_MAX;
+				bool bLimitsOk = m_tSpan.m_iCodes+iLengthCP<=iCpLimit && m_tSpan.m_iWords<=GetWordsLimit ( *this, m_tSpan.m_iQwords );
+
+				if ( ( m_bForceAllWords && m_tPass.m_uQwords==uAllQwords && !bLimitsOk ) ||
+					( !m_bForceAllWords && !bLimitsOk ) )
+				{
+					m_bQwordsChanged = true;
+					WeightAndSubmit ();
+					m_eState = STATE_ADD_WORD;
+				}
+
+				m_tSpan.Add ( m_iCurToken, tTok.m_bWord || tTok.m_bStopWord, bQWord, iTermIndex, iLengthCP );
+				m_bQwordsChanged |= bQWord;
+
+				if ( m_eState==STATE_ADD_WORD && (tTok.m_bWord || tTok.m_bStopWord) )
+				{
+					m_bQwordsChanged |= bQWord;
+					ShrinkSpanHead();
+					WeightAndSubmit();
+				}
+			}
+			break;
+
+		case STATE_ADD_WORD:
+			m_tSpan.Add ( m_iCurToken, tTok.m_bWord || tTok.m_bStopWord, bQWord, iTermIndex, iLengthCP );
+
+			if ( tTok.m_bWord || tTok.m_bStopWord )
+			{
+				m_bQwordsChanged |= bQWord;
+				ShrinkSpanHead();
+				WeightAndSubmit();
+			}
+			break;
+		}
+
+		m_iCurToken++;
+
+		if ( m_pTokenContainer )
+			m_pTokenContainer->StoreToken ( tTok );
+		return true;
+	}
+
+	void OnFinish ()
+	{
+		switch ( m_eState )
+		{
+		case STATE_WINDOW_SETUP:
+			WeightAndSubmit();
+			break;
+		case STATE_ADD_WORD:
+			break;
+		}
+		SubmitPassages();
+	}
+
+	bool OnOverlap ( int iStart, int iLen, int iBoundary )
+	{
+		// most frequent case
+		if ( sphIsSpace ( m_pDoc[iStart] ) && iLen==1 && iBoundary<0 && m_eState==STATE_ADD_WORD )
+		{
+			m_tSpan.Add ( m_iCurToken++, false, false, -1, 1 );
+			if ( m_bAppendSentenceEnd )
+				OnSPZ ( MAGIC_CODE_SENTENCE, 0, NULL, -1 );
+		} else
+		{
+			SplitSpaceIntoTokens ( m_dSpaces, m_pDoc, iStart, iLen, iBoundary );
+			AddSpaces ( iBoundary );
+		}
+
+		if ( m_pTokenContainer )
+			m_pTokenContainer->StoreOverlap ( iStart, iLen, iBoundary );
+		return true;
+	}
+
+	void OnSkipHtml ( int iStart, int iLen )
+	{
+		if ( m_pTokenContainer )
+			m_pTokenContainer->StoreSkipHtml ( iStart, iLen );
+	}
+
+	void OnSPZ ( BYTE iSPZ, DWORD uPosition, const char * szZone, int iZone )
+	{
+		if ( m_bAppendSentenceEnd )
+			m_bAppendSentenceEnd = false;
+		else if ( iSPZ==MAGIC_CODE_SENTENCE )
+		{
+			m_bAppendSentenceEnd = true;
+			return;
+		}
+
+		switch ( m_eState )
+		{
+		case STATE_WINDOW_SETUP:
+			WeightAndSubmit();
+			break;
+
+		case STATE_ADD_WORD:
+			m_bQwordsChanged = true;
+			WeightAndSubmit();
+			m_eState = STATE_WINDOW_SETUP;
+			break;
+		}
+
+		m_bQwordsChanged = true;
+		m_tSpan.Reset();
+
+		if ( m_pTokenContainer )
+			m_pTokenContainer->StoreSPZ ( iSPZ, uPosition, szZone, iZone );
+	}
+
+	void OnTail ( int iStart, int iLen, int iBoundary )
+	{
+		SplitSpaceIntoTokens ( m_dSpaces, m_pDoc, iStart, iLen, iBoundary );
+		AddSpaces ( iBoundary );
+		ShrinkSpanHead();
+		WeightAndSubmit();
+
+		if ( m_pTokenContainer )
+			m_pTokenContainer->StoreTail ( iStart, iLen, iBoundary );
+	}
+
+	const CSphVector<int> * GetHitlist ( const XQKeyword_t & ) const
+	{
+		return NULL;
+	}
+
+private:
+	enum State_e
+	{
+		STATE_WINDOW_SETUP,
+		STATE_ADD_WORD
+	};
+
+	State_e				m_eState;
+	bool				m_bQwordsChanged;
+	bool				m_bAppendSentenceEnd;
+	CacheStreamer_c *	m_pTokenContainer;
+
+
+	void AddSpaces ( int iBoundary )
+	{
+		switch ( m_eState )
+		{
+		case STATE_WINDOW_SETUP:
+			{
+				DWORD uAllQwords = ( 1 << m_tContainer.GetNumTerms() )-1;
+				const int iCpLimit = m_iLimit ? m_iLimit : INT_MAX;
+				ARRAY_FOREACH ( i, m_dSpaces )
+				{
+					bool bBoundary = iBoundary==m_dSpaces[i].m_iStartBytes;
+					bool bLimitsOk = m_tSpan.m_iCodes+m_dSpaces[i].m_iLengthCP<=iCpLimit && m_tSpan.m_iWords<=GetWordsLimit ( *this, m_tSpan.m_iQwords );
+
+					if ( m_bForceAllWords && m_tPass.m_uQwords!=uAllQwords )
+						bLimitsOk = true;
+
+					if ( ( bBoundary || !bLimitsOk ) && m_eState!=STATE_ADD_WORD )
+					{
+						if ( bBoundary )
+						{
+							m_tSpan.Add ( m_iCurToken++, false, false, -1, m_dSpaces[i].m_iLengthCP );
+							WeightAndSubmit();
+							m_tSpan.Reset();
+
+						} else
+						{
+							WeightAndSubmit();
+							m_eState = STATE_ADD_WORD;
+						}
+					}
+
+					if ( !bBoundary )
+						m_tSpan.Add ( m_iCurToken++, false, false, -1, m_dSpaces[i].m_iLengthCP );
+
+					if ( m_bAppendSentenceEnd )
+						OnSPZ ( MAGIC_CODE_SENTENCE, 0, NULL, -1 );
+				}
+			}
+			break;
+
+		case STATE_ADD_WORD:
+			ARRAY_FOREACH ( i, m_dSpaces )
+			{
+				m_tSpan.Add ( m_iCurToken++, false, false, -1, m_dSpaces[i].m_iLengthCP );
+				if ( iBoundary==m_dSpaces[i].m_iStartBytes )
+				{
+					WeightAndSubmit ();
+					m_tSpan.Reset();
+					m_eState = STATE_WINDOW_SETUP;
+				}
+
+				if ( !i && m_bAppendSentenceEnd )
+					OnSPZ ( MAGIC_CODE_SENTENCE, 0, NULL, -1 );
+			}
+			break;
+		}
+	}
+
+	void WeightAndSubmit ()
+	{
+		if ( m_tSpan.m_iQwords )
+		{
+			if ( m_bQwordsChanged )
+			{
+				CalcPassageWeight ( GetWordsLimit ( *this, m_tSpan.m_iQwords ) );
+				m_bQwordsChanged = false;
+			} else
+				UpdateGaps ( GetWordsLimit ( *this, m_tSpan.m_iQwords ) );
+
+			if ( m_tPass.m_uQwords )
+				FlushPassage();
+		}
+	}
+
+	void UpdateGaps ( int iMaxWords )
+	{
+		m_tPass.m_iMinGap = iMaxWords-1;
+		m_tPass.m_iAroundBefore = m_tPass.m_iAroundAfter = 0;
+		DWORD uQwords = 0;
+		int iWord = -1;
+		for ( int i = 0; i < m_tSpan.GetNumTokens(); i++ )
+		{
+			const SpanToken_t & tTok = m_tSpan.GetToken(i);
+			if ( !tTok.m_iWordFlag )
+				continue;
+
+			iWord++;
+			if ( tTok.m_uQwordMask )
+			{
+				m_tPass.m_iMinGap = Min ( m_tPass.m_iMinGap, iWord );
+				m_tPass.m_iMinGap = Min ( m_tPass.m_iMinGap, m_tSpan.m_iWords-1-iWord );
+			}
+
+			uQwords |= tTok.m_uQwordMask;
+			m_tPass.m_iAroundBefore += ( uQwords==0 );
+			m_tPass.m_iAroundAfter = ( tTok.m_uQwordMask ? 0 : m_tPass.m_iAroundAfter+1 );
+		}
+		assert ( m_tPass.m_iMinGap>=0 );
+	}
+
+	void FlushPassage ()
+	{
+		m_tPass.m_iStart = m_tSpan.m_iStart;
+		m_tPass.m_iTokens = m_tSpan.GetNumTokens();
+		m_tPass.m_iCodes = m_tSpan.m_iCodes;
+		m_tPass.m_iWords = m_tSpan.m_iWords;
+
+		int iBefore = 0;
+		while ( m_tPass.m_iAroundBefore>m_iAround )
+		{
+			assert ( m_tPass.m_iStart<m_tPass.m_iStartLimit );
+			const SpanToken_t & tTok = m_tSpan.GetToken ( iBefore );
+			assert ( tTok.m_uQwordMask==0 );
+
+			m_tPass.m_iCodes -= tTok.m_iLengthCP;
+			m_tPass.m_iAroundBefore -= tTok.m_iWordFlag;
+			m_tPass.m_iStart++;
+			m_tPass.m_iTokens--;
+			m_tPass.m_iWords -= tTok.m_iWordFlag;
+			iBefore++;
+		}
+
+		int iAfter = m_tSpan.GetNumTokens()-1;
+		while ( m_tPass.m_iAroundAfter>m_iAround )
+		{
+			assert ( m_tPass.m_iEndLimit<m_tPass.m_iStart+m_tPass.m_iTokens-1 );
+			const SpanToken_t & tTok = m_tSpan.GetToken ( iAfter );
+			assert ( tTok.m_uQwordMask==0 );
+
+			m_tPass.m_iCodes -= tTok.m_iLengthCP;
+			m_tPass.m_iAroundAfter -= tTok.m_iWordFlag;
+			m_tPass.m_iTokens--;
+			m_tPass.m_iWords -= tTok.m_iWordFlag;
+			iAfter--;
+		}
+
+		// if it's the very first one, do add
+		if ( !m_dPassages.GetLength() )
+		{
+			Passage_t & tPassage = m_dPassages.Add ();
+			tPassage.CopyData ( m_tPass );
+			AppendBeforeAfterTokens ( tPassage, m_tSpan );
+			UpdateTopPassages ( m_tPass.m_iQwordCount==1 ? sphLog2 ( m_tPass.m_uQwords )-1 : -1, m_tPass.GetWeight() );
+			return;
+		}
+
+		// check if it's new or better than the last one
+		Passage_t & tLast = m_dPassages.Last();
+		if ( ( m_tPass.m_iStartLimit<=tLast.m_iStartLimit && tLast.m_iEndLimit<=m_tPass.m_iEndLimit )
+			|| ( tLast.m_iStartLimit<=m_tPass.m_iStartLimit && m_tPass.m_iEndLimit<=tLast.m_iEndLimit ) )
+		{
+			// overlapping passages, check which one is better centered
+			int iPassPre = m_tPass.m_iStartLimit - m_tPass.m_iStart + 1;
+			int iPassPost = m_tPass.m_iStart + m_tPass.m_iTokens - m_tPass.m_iEndLimit + 1;
+			float fPassGap = (float)Max ( iPassPre, iPassPost ) / (float)Min ( iPassPre, iPassPost );
+
+			int iLastPre = tLast.m_iStartLimit - tLast.m_iStart + 1;
+			int iLastPost = tLast.m_iStart + tLast.m_iTokens - tLast.m_iEndLimit + 1;
+			float fLastGap = (float)Max ( iLastPre, iLastPost ) / (float)Min ( iLastPre, iLastPost );
+
+			int iWeightLast = tLast.GetWeight();
+			int iWeightPass = m_tPass.GetWeight();
+			// centered snippet wins last passage
+			if ( tLast.m_iUniqQwords<=m_tPass.m_iUniqQwords &&
+				( iWeightLast<iWeightPass || ( iWeightLast==iWeightPass && fPassGap<fLastGap ) ) )
+			{
+				tLast.CopyData ( m_tPass );
+				AppendBeforeAfterTokens ( tLast, m_tSpan );
+			}
+			return;
+		}
+
+		// after a certain threshold, start being picky
+		// only accept passages with new keywords, or big enough weight
+		int iWeight = m_tPass.GetWeight();
+		int iQword = -1;
+		if ( m_tPass.m_iQwordCount==1 )
+			iQword = sphLog2 ( m_tPass.m_uQwords )-1;
+
+		while ( m_dPassages.GetLength()>m_iThresh )
+		{
+			// completely new keyword? accept
+			if ( m_tPass.m_uQwords & ~m_uPassagesQwords )
+				break;
+
+			// single keyword passage? accept if better weight, otherwise reject
+			if ( iQword>=0 )
+			{
+				if ( iWeight<=m_dQwordWeights[iQword] )
+					return;
+				break;
+			}
+
+			// multi-keyword passage? accept if weight within top-N
+			assert ( iQword<0 );
+			if ( iWeight<=m_dTopPassageWeights[m_iThresh] )
+				return;
+			break;
+		}
+
+		// kill them all, god will know his own
+		Passage_t & tPassage = m_dPassages.Add();
+		tPassage.CopyData ( m_tPass );
+		AppendBeforeAfterTokens ( tPassage, m_tSpan );
+		UpdateTopPassages ( iQword, iWeight );
+	}
+
+	void UpdateTopPassages ( int iQword, int iWeight )
+	{
+		m_uPassagesQwords |= m_tPass.m_uQwords;
+		if ( iQword>=0 )
+			m_dQwordWeights[iQword] = Max ( m_dQwordWeights[iQword], iWeight );
+		m_dTopPassageWeights.Add ( iWeight );
+		if ( ( m_dTopPassageWeights.GetLength() & ( m_iThresh-1 ) )==0 )
+			m_dTopPassageWeights.RSort();
+	}
+
+	void ShrinkSpanHead ()
+	{
+		const int iCpLimit = m_iLimit ? m_iLimit : INT_MAX;
+
+		int iTokenStart = 0;
+		const int iMaxToken = m_tSpan.GetNumTokens() - 1;
+
+		// drop front tokens until the window fits into both word and CP limits
+		while ( iTokenStart < iMaxToken
+			&& ( m_tSpan.m_iCodes > iCpLimit || m_tSpan.m_iWords > GetWordsLimit ( *this, m_tSpan.m_iQwords ) ) )
+		{
+			const SpanToken_t & tTok = m_tSpan.GetToken ( iTokenStart );
+			if ( tTok.m_uQwordMask )
+			{
+				m_tSpan.m_iQwords--; // FIXME? might not be true if we remove a duped keyword
+				m_bQwordsChanged = true;
+			}
+			m_tSpan.m_iWords -= tTok.m_iWordFlag;
+			m_tSpan.m_iCodes -= tTok.m_iLengthCP;
+			iTokenStart++;
+		}
+		m_tSpan.m_iStart += iTokenStart;
+
+		// remove extra tokens
+		if ( iTokenStart>=m_tSpan.GetNumTokens() )
+			m_tSpan.Reset();
+		else if ( iTokenStart>0 )
+			m_tSpan.RemoveStartingTokens ( iTokenStart );
+	}
+};
+
+
+/// functor that highlights selected passages
+class HighlightPassages_c : public HighlightPlain_c
+{
+public:
+	CSphVector<int> m_dPassageHeads;
+
+	HighlightPassages_c ( SnippetsDocIndex_c & tContainer, ISphTokenizer * pTokenizer, CSphDict * pDict, const ExcerptQuery_t & tQuery, const CSphIndexSettings & tSettingsIndex, const char * sDoc, int iDocLen,
+		const CSphVector<SphHitMark_t> * dHits, const CSphVector<Passage_t> & dPassages, const FunctorZoneInfo_t * pZoneInfo )
+		: HighlightPlain_c ( tContainer, pTokenizer, pDict, tQuery, tSettingsIndex, sDoc, iDocLen, EstimateResult ( tQuery, iDocLen ) )
+		, m_pHit ( dHits ? dHits->Begin() : NULL )
+		, m_pHitEnd ( dHits ? dHits->Begin()+dHits->GetLength() : NULL )
+		, m_dPassages ( dPassages )
+		, m_iCurToken ( 0 )
+		, m_iCurPassage	( -1 )
+		, m_iSeparatorLen ( m_sChunkSeparator.Length() )
+		, m_bLastWasSeparator ( false )
+		, m_pZoneInfo ( pZoneInfo )
+		, m_iOpenTill ( 0 )
+		, m_iLastPos ( 0 )
+	{
+		if ( m_bWeightOrder )
+			m_dPassageHeads.Reserve(1024);
+	}
+
+	bool OnToken ( TokenInfo_t & tTok, const CSphVector<SphWordID_t> & )
+	{
+		assert ( m_pDoc );
+		assert ( tTok.m_iStart>=0 && m_pDoc+tTok.m_iStart+tTok.m_iLen<=m_pDocMax );
+
+		CheckClose ( tTok.m_uPosition );
+		UpdatePassage ( tTok.m_iStart );
+
+		if ( m_iCurPassage!=-1 )
+		{
+			m_bLastWasSeparator = false;
+			while ( m_pHit<m_pHitEnd && m_pHit->m_uPosition+m_pHit->m_uSpan<=tTok.m_uPosition )
+				m_pHit++;
+
+			if ( m_bExactPhrase )
+			{
+				// marker folding, emit "before" marker at span start only
+				if ( m_pHit<m_pHitEnd && tTok.m_uPosition==m_pHit->m_uPosition )
+					ResultEmit ( m_sBeforeMatch.cstr(), m_iBeforeLen, m_bHasBeforePassageMacro, m_iPassageId, m_sBeforeMatchPassage.cstr(), m_iBeforePostLen );
+
+				// emit token itself
+				ResultEmit ( m_pDoc+tTok.m_iStart, tTok.m_iLen );
+
+				// marker folding, emit "after" marker at span end only
+				if ( m_pHit<m_pHitEnd && tTok.m_uPosition==m_pHit->m_uPosition+m_pHit->m_uSpan-1 )
+					ResultEmit ( m_sAfterMatch.cstr(), m_iAfterLen, m_bHasAfterPassageMacro, m_iPassageId++, m_sAfterMatchPassage.cstr(), m_iAfterPostLen );
+
+			} else
+			{
+				bool bHit = m_pHit<m_pHitEnd && tTok.m_uPosition>=m_pHit->m_uPosition && tTok.m_uPosition<=m_pHit->m_uPosition+m_pHit->m_uSpan-1;
+				if ( bHit && !m_iOpenTill )
+				{
+					ResultEmit ( m_sBeforeMatch.cstr(), m_iBeforeLen, m_bHasBeforePassageMacro, m_iPassageId, m_sBeforeMatchPassage.cstr(), m_iBeforePostLen );
+					m_iOpenTill = m_pHit->m_uPosition+m_pHit->m_uSpan;
+				}
+
+				// emit token itself
+				ResultEmit ( m_pDoc+tTok.m_iStart, tTok.m_iLen );
+			}
+		}
+
+		m_iLastPos = tTok.m_uPosition;
+		m_iCurToken++;
+		return true;
+	}
+
+	bool OnOverlap ( int iStart, int iLen, int iBoundary )
+	{
+		CheckClose ( m_iLastPos+1 );
+		EmitSpaces ( iStart, iLen, iBoundary );
+		return true;
+	}
+
+	void OnTail ( int iStart, int iLen, int iBoundary )
+	{
+		CheckClose ( m_iLastPos+1 );
+		EmitSpaces ( iStart, iLen, iBoundary );
+	}
+
+	void OnFinish()
+	{
+		if ( !m_iOpenTill )
+			return;
+		ResultEmit ( m_sAfterMatch.cstr(), m_iAfterLen, m_bHasAfterPassageMacro, m_iPassageId++, m_sAfterMatchPassage.cstr(), m_iAfterPostLen );
+	}
+
+private:
+	const SphHitMark_t * m_pHit;
+	const SphHitMark_t * m_pHitEnd;
+	const CSphVector<Passage_t> &	m_dPassages;
+	int								m_iCurToken;
+	int								m_iCurPassage;
+	int								m_iSeparatorLen;
+	bool							m_bLastWasSeparator;
+	TokenSpan_t						m_tTmpSpan;
+	CSphVector<Space_t>				m_dSpaces;
+	const FunctorZoneInfo_t *		m_pZoneInfo;
+	int								m_iOpenTill;
+	int								m_iLastPos;
+
+	void EmitZoneName ( int iStart ) const
+	{
+		if ( !m_bEmitZones || !m_pZoneInfo || !m_pZoneInfo->m_dZonePos.GetLength() )
+			return;
+
+		int iZone = FindSpan ( m_pZoneInfo->m_dZonePos, iStart );
+		if ( iZone!=-1 )
+		{
+			int iParent = m_pZoneInfo->m_dZoneParent[iZone];
+			m_pZoneInfo->m_hZones.IterateStart();
+			while ( m_pZoneInfo->m_hZones.IterateNext() )
+			{
+				if ( m_pZoneInfo->m_hZones.IterateGet()!=iParent )
+					continue;
+
+				ResultEmit ( "<", 1 );
+				ResultEmit ( m_pZoneInfo->m_hZones.IterateGetKey().cstr(), m_pZoneInfo->m_hZones.IterateGetKey().Length() );
+				ResultEmit ( ">", 1 );
+				break;
+			}
+		}
+	}
+
+
+	void EmitSpaces ( int iStart, int iLen, int iBoundary )
+	{
+		assert ( m_pDoc );
+		assert ( iStart>=0 && m_pDoc+iStart+iLen<=m_pDocMax );
+
+		SplitSpaceIntoTokens ( m_dSpaces, m_pDoc, iStart, iLen, iBoundary );
+		ARRAY_FOREACH ( i, m_dSpaces )
+		{
+			UpdatePassage ( iStart );
+
+			if ( m_iCurPassage!=-1 )
+				ResultEmit ( m_pDoc+m_dSpaces[i].m_iStartBytes, m_dSpaces[i].m_iLengthBytes );
+
+			m_iCurToken++;
+		}
+	}
+
+	void UpdatePassage ( int iStart )
+	{
+		const Passage_t * pPassage = m_dPassages.Begin() + m_iCurPassage;
+		const Passage_t * pNext = m_dPassages.Begin() + m_iCurPassage + 1;
+		if ( !m_bLastWasSeparator && m_iCurPassage!=-1 && !m_bWeightOrder
+			&& m_iCurToken==( pPassage->m_iStart + pPassage->m_iTokens )
+			&& !( ( m_iCurPassage+1 )<m_dPassages.GetLength() && m_iCurToken>=pNext->m_iStart
+				&& m_iCurToken<( pNext->m_iStart + pNext->m_iTokens ) ) )
+		{
+			ResultEmit ( m_sChunkSeparator.cstr(), m_iSeparatorLen );
+			m_bLastWasSeparator = true;
+		}
+
+		int iPassage = m_iCurPassage;
+		if ( m_iCurPassage==-1 || m_iCurToken<pPassage->m_iStart || m_iCurToken>( pPassage->m_iStart + pPassage->m_iTokens - 1 ) )
+		{
+			int iNextPassage = 0;
+			if ( m_iCurPassage!=-1 && m_iCurToken>( pPassage->m_iStart + pPassage->m_iTokens - 1 ) )
+				iNextPassage = m_iCurPassage+1;
+
+			m_iCurPassage = -1;
+			for ( int i=iNextPassage; i<m_dPassages.GetLength(); i++ )
+				if ( m_iCurToken>=m_dPassages[i].m_iStart && m_iCurToken<=( m_dPassages[i].m_iStart + m_dPassages[i].m_iTokens - 1 ) )
+				{
+					m_iCurPassage = i;
+					break;
+				}
+		}
+
+		if ( m_iCurPassage!=-1 && iPassage!=m_iCurPassage )
+		{
+			if ( !m_bLastWasSeparator && m_iCurToken && !m_bWeightOrder )
+			{
+				ResultEmit ( m_sChunkSeparator.cstr(), m_iSeparatorLen );
+				m_bLastWasSeparator = true;
+			}
+
+			if ( m_bWeightOrder )
+				m_dPassageHeads.Add ( m_dResult.GetLength() );
+
+			EmitZoneName ( iStart );
+		}
+	}
+
+	void CheckClose ( int iPos )
+	{
+		// marker folding, emit "after" marker at span end only
+		if ( !m_iOpenTill || iPos<m_iOpenTill )
+			return;
+
+		ResultEmit ( m_sAfterMatch.cstr(), m_iAfterLen, m_bHasAfterPassageMacro, m_iPassageId++, m_sAfterMatchPassage.cstr(), m_iAfterPostLen );
+		m_iOpenTill = 0;
 	}
 };
 
@@ -2362,25 +2825,20 @@ static void CopyZoneName ( CSphVector<char> & dName, const char * sZone, int iLe
 }
 
 
-static void AddZone ( const char * pStart, const char * pEnd, int uPosition, TokenFunctorTraits_c & tFunctor
-						, CSphVector<int> & dZoneStack, CSphVector<char> & dZoneName
-#ifndef NDEBUG
-						, const char * pBuf
-						, CSphVector<int> & dZonePos
-#endif
-					)
+static int AddZone ( const char * pStart, const char * pEnd, int uPosition, TokenFunctorTraits_c & tFunctor
+						, CSphVector<int> & dZoneStack, CSphVector<char> & dZoneName, const char * pBuf )
 {
 	CSphVector<ZonePacked_t> & dZones = tFunctor.m_dZones;
-	SmallStringHash_T<int> & hZones = tFunctor.m_hZones;
+	SmallStringHash_T<int> & hZones = tFunctor.m_tZoneInfo.m_hZones;
+	CSphVector<int>	& dZonePos = tFunctor.m_tZoneInfo.m_dZonePos;
+	CSphVector<int>	& dZoneParent = tFunctor.m_tZoneInfo.m_dZoneParent;
+	bool bNeedExtraZoneInfo = tFunctor.m_bCollectExtraZoneInfo;
+
+	int iZone;
 
 	// span's management
 	if ( *pStart!='/' )	// open zone
 	{
-#ifndef NDEBUG
-		// zone position in characters
-		dZonePos.Add ( pStart-pBuf );
-#endif
-
 		// zone stack management
 		int iSelf = dZones.GetLength();
 		dZoneStack.Add ( iSelf );
@@ -2389,8 +2847,23 @@ static void AddZone ( const char * pStart, const char * pEnd, int uPosition, Tok
 		int iZoneNameLen = pEnd-pStart-1;
 		CopyZoneName ( dZoneName, pStart, iZoneNameLen );
 
-		int iZone = FindAddZone ( dZoneName.Begin(), iZoneNameLen, hZones );
+		iZone = FindAddZone ( dZoneName.Begin(), iZoneNameLen, hZones );
 		dZones.Add ( sphPackZone ( uPosition, iSelf, iZone ) );
+
+		if ( bNeedExtraZoneInfo )
+		{
+			// the parent for the open zone is the zone itself
+			dZoneParent.Add ( iZone );
+
+			// zone position in characters
+			dZonePos.Add ( pStart-pBuf );
+		}
+
+#ifndef NDEBUG
+		if ( !bNeedExtraZoneInfo )
+			dZonePos.Add ( pStart-pBuf );
+#endif
+
 	} else					// close zone
 	{
 #ifndef NDEBUG
@@ -2403,7 +2876,7 @@ static void AddZone ( const char * pStart, const char * pEnd, int uPosition, Tok
 		int iZoneNameLen = pEnd-pStart-2;
 		CopyZoneName ( dZoneName, pStart+1, iZoneNameLen );
 
-		int iZone = FindAddZone ( dZoneName.Begin(), iZoneNameLen, hZones );
+		iZone = FindAddZone ( dZoneName.Begin(), iZoneNameLen, hZones );
 		int iOpen = dZoneStack.Last();
 		int iClose = dZones.GetLength();
 		uint64_t uOpenPacked = dZones[ iOpen ];
@@ -2413,20 +2886,47 @@ static void AddZone ( const char * pStart, const char * pEnd, int uPosition, Tok
 		dZones[iOpen] = sphPackZone ( uOpenPos, iClose, iZone );
 		dZones.Add ( sphPackZone ( uPosition, iOpen, iZone ) );
 
+		if ( bNeedExtraZoneInfo )
+		{
+			// zone position in characters
+			dZonePos.Add ( pStart-pBuf );
+
+			// the parent for the closing zone is the previous zone on stack
+			int iParentZone = dZoneStack.GetLength()>2 ? dZoneStack[dZoneStack.GetLength()-2] : 0;
+			uint64_t uParentPacked = dZones.GetLength() && iParentZone<dZones.GetLength() ? dZones[iParentZone] : 0;
+			dZoneParent.Add ( (int)( uParentPacked & UINT16_MASK ) );
+		}
+
 #ifndef NDEBUG
-		// zone position in characters
-		dZonePos.Add ( pStart-pBuf );
+		if ( !bNeedExtraZoneInfo )
+			dZonePos.Add ( pStart-pBuf );
 #endif
 
 
 		// pop up current zone from zone's stack
 		dZoneStack.Resize ( dZoneStack.GetLength()-1 );
 	}
+
+	return iZone;
+}
+
+
+static void CopyString ( BYTE * sDst, const BYTE * sSrc, int iLen )
+{
+	const int MAX_WORD_BYTES = 3*SPH_MAX_WORD_LEN;
+	int iBackup = ( iLen > MAX_WORD_BYTES ) ? MAX_WORD_BYTES : iLen;
+	int iBackup2 = ( iBackup+3 )>>2;
+	DWORD * d = (DWORD*)sDst;
+	DWORD * s = (DWORD*)sSrc;
+	while ( iBackup2-->0 )
+		*d++ = *s++;
+	sDst[iBackup] = '\0';
 }
 
 
 /// tokenize document using a given functor
-static void TokenizeDocument ( TokenFunctorTraits_c & tFunctor, const CSphHTMLStripper * pStripper )
+template < typename T >
+static void TokenizeDocument ( T & tFunctor, const CSphHTMLStripper * pStripper, DWORD iSPZ )
 {
 	ISphTokenizer * pTokenizer = tFunctor.m_pTokenizer;
 	CSphDict * pDict = tFunctor.m_pDict;
@@ -2436,61 +2936,113 @@ static void TokenizeDocument ( TokenFunctorTraits_c & tFunctor, const CSphHTMLSt
 	const char * pBufferEnd = pTokenizer->GetBufferEnd();
 	assert ( pStartPtr && pLastTokenEnd );
 
+	BYTE sNonStemmed [ 3*SPH_MAX_WORD_LEN+4];
+
+	TokenInfo_t tTok;
+	tTok.m_iStart = 0;
+	tTok.m_uPosition = 0;
+	tTok.m_sWord = sNonStemmed;
+	tTok.m_bStopWord = false;
+	tTok.m_iTermIndex = -1;
+
 	bool bRetainHtml = tFunctor.m_sStripMode=="retain";
-	int iSPZ = tFunctor.m_iPassageBoundary;
-	int uPosition = 0;
 	BYTE * sWord = NULL;
-	SphWordID_t iBlendID = 0;
-	SphWordID_t iBlendedExactID = 0;
+	DWORD uPosition = 0;
+	DWORD uStep = 1;
+	const char * pBlendedStart = NULL;
 	const char * pBlendedEnd = NULL;
+	bool bBlendedHead = false;
+	bool bBlendedPart = false;
+	CSphVector<SphWordID_t> dMultiToken;
 
 	CSphVector<int> dZoneStack;
 	CSphVector<char> dZoneName ( 16+3*SPH_MAX_WORD_LEN );
-	BYTE sExactBuf [ 3*SPH_MAX_WORD_LEN+4 ];
-	BYTE sNonStemmed [ 3*SPH_MAX_WORD_LEN+3];
 
 	// FIXME!!! replace by query SPZ extraction pass
 	if ( !iSPZ && ( bRetainHtml && tFunctor.m_bHighlightQuery ) )
 		iSPZ = MAGIC_CODE_ZONE;
 
-#ifndef NDEBUG
-	CSphVector<int> dZonePos;
-#endif
-
-	const bool bUtf8 = pTokenizer->IsUtf8();
 	while ( ( sWord = pTokenizer->GetToken() )!=NULL )
 	{
+		const char * pTokenStart = pTokenizer->GetTokenStart ();
+
+		if ( pBlendedEnd<pTokenStart )
+		{
+			// FIXME!!! implement proper handling of blend-chars
+			if ( pLastTokenEnd<pBlendedEnd && bBlendedPart )
+			{
+				tTok.m_uWordId = 0;
+				tTok.m_bStopWord = false;
+				tTok.m_uPosition = uPosition; // let's stick to last blended part
+				tTok.m_iStart = pLastTokenEnd - pStartPtr;
+				tTok.m_iLen = pBlendedEnd - pLastTokenEnd;
+				tTok.m_bWord = false;
+				if ( !tFunctor.OnToken ( tTok, dMultiToken ) )
+				{
+					tFunctor.OnFinish();
+					return;
+				}
+				pLastTokenEnd = pBlendedEnd;
+			}
+
+			dMultiToken.Resize ( 0 );
+		}
+
+		uPosition += uStep + pTokenizer->GetOvershortCount();
+		if ( pTokenizer->GetBoundary() )
+			uPosition += tFunctor.m_iBoundaryStep;
+		if ( pTokenizer->TokenIsBlended() )
+			uStep = 0;
+
+		// handle only blended parts
 		if ( pTokenizer->TokenIsBlended() )
 		{
-			if ( pBlendedEnd<pTokenizer->GetTokenEnd() )
+			if ( tFunctor.m_bIndexExactWords && pTokenizer->GetTokenMorph()!=SPH_TOKEN_MORPH_GUESS )
 			{
-				iBlendID = pDict->GetWordID ( sWord );
-				iBlendedExactID = 0;
-				pBlendedEnd = pTokenizer->GetTokenEnd();
-
-				if ( tFunctor.m_bHighlightQuery && tFunctor.m_bIndexExactWords )
-				{
-					int iLen = strlen ( (const char *)sWord );
-					if ( iLen+2>sizeof(sExactBuf) )
-						iLen = sizeof(sExactBuf)-2;
-					memcpy ( sExactBuf + 1, sWord, iLen );
-					sExactBuf[0] = MAGIC_WORD_HEAD_NONSTEMMED;
-					sExactBuf[iLen+1] = '\0';
-					iBlendedExactID = pDict->GetWordIDNonStemmed ( sExactBuf );
-				}
+				BYTE sTmpBuf [ 3*SPH_MAX_WORD_LEN+4];
+				sTmpBuf[0] = MAGIC_WORD_HEAD_NONSTEMMED;
+				CopyString ( sTmpBuf+1, sWord, pTokenizer->GetTokenEnd() - pTokenStart );
+				dMultiToken.Add ( tFunctor.m_pDict->GetWordIDNonStemmed ( sTmpBuf ) );
 			}
+
+			// must be last because it can change (stem) sWord
+			dMultiToken.Add ( tFunctor.m_pDict->GetWordID ( sWord ) );
+			pBlendedStart = pTokenizer->GetTokenStart();
+			pBlendedEnd = Max ( pBlendedEnd, pTokenizer->GetTokenEnd() );
+			bBlendedHead = true;
 			continue;
 		}
 
-		uPosition += pTokenizer->GetOvershortCount();
-
-		const char * pTokenStart = pTokenizer->GetTokenStart ();
-
 		if ( pTokenStart>pLastTokenEnd )
 		{
-			tFunctor.OnOverlap ( pLastTokenEnd-pStartPtr, pTokenStart - pLastTokenEnd );
+			bool bDone = false;
+			if ( pBlendedStart<pTokenStart && bBlendedHead )
+			{
+				// FIXME!!! implement proper handling of blend-chars
+				bDone = !tFunctor.OnOverlap ( pLastTokenEnd-pStartPtr, pBlendedStart - pLastTokenEnd, pTokenizer->GetBoundary() ? pTokenizer->GetBoundaryOffset() : -1 );
+				tTok.m_uWordId = 0;
+				tTok.m_bStopWord = false;
+				tTok.m_uPosition = uPosition; // let's stick to 1st blended part
+				tTok.m_iStart = pBlendedStart - pStartPtr;
+				tTok.m_iLen = pTokenStart - pBlendedStart;
+				tTok.m_bWord = false;
+				if ( !bDone )
+					bDone = !tFunctor.OnToken ( tTok, dMultiToken );
+			} else
+			{
+				bDone = !tFunctor.OnOverlap ( pLastTokenEnd-pStartPtr, pTokenStart - pLastTokenEnd, pTokenizer->GetBoundary() ? pTokenizer->GetBoundaryOffset() : -1 );
+			}
+
+			if ( bDone	)
+			{
+				tFunctor.OnFinish();
+				return;
+			}
+
 			pLastTokenEnd = pTokenStart;
 		}
+		bBlendedHead = false;
+		bBlendedPart = pTokenizer->TokenIsBlendedPart();
 
 		if ( bRetainHtml && *pTokenStart=='<' )
 		{
@@ -2518,23 +3070,17 @@ static void TokenizeDocument ( TokenFunctorTraits_c & tFunctor, const CSphHTMLSt
 				pEndSPZ += ( pEndSPZ+1<=pBufferEnd && ( *pEndSPZ )!='\0' ); // skip closing angle bracket, if any
 
 				assert ( pTag->m_bPara || pTag->m_bZone );
-				assert ( pTag->m_bPara || pEndSPZ[0]=='\0' || pEndSPZ[-1]=='>' ); // should be at tag's end
+				assert ( pTag->m_bPara || ( pEndSPZ && ( pEndSPZ[0]=='\0' || pEndSPZ[-1]=='>' ) ) ); // should be at tag's end
 				assert ( pEndSPZ && pEndSPZ<=pBufferEnd );
-
-				uPosition++;
 
 				// handle paragraph boundaries
 				if ( pTag->m_bPara )
 				{
-					tFunctor.OnSPZ ( MAGIC_CODE_PARAGRAPH, uPosition, NULL );
+					tFunctor.OnSPZ ( MAGIC_CODE_PARAGRAPH, uPosition, NULL, -1 );
 				} else if ( pTag->m_bZone ) // handle zones
 				{
-#ifndef NDEBUG
-					AddZone ( pTokenStart+1, pTokenStart+2+iZoneNameLen, uPosition, tFunctor, dZoneStack, dZoneName, pStartPtr, dZonePos );
-#else
-					AddZone ( pTokenStart+1, pTokenStart+2+iZoneNameLen, uPosition, tFunctor, dZoneStack, dZoneName );
-#endif
-					tFunctor.OnSPZ ( MAGIC_CODE_ZONE, uPosition, dZoneName.Begin() );
+					int iZone = AddZone ( pTokenStart+1, pTokenStart+2+iZoneNameLen, uPosition, tFunctor, dZoneStack, dZoneName, pStartPtr );
+					tFunctor.OnSPZ ( MAGIC_CODE_ZONE, uPosition, dZoneName.Begin(), iZone );
 				}
 			}
 
@@ -2547,8 +3093,7 @@ static void TokenizeDocument ( TokenFunctorTraits_c & tFunctor, const CSphHTMLSt
 		// FIXME!!! it heavily depends on such attitude MAGIC_CODE_SENTENCE < MAGIC_CODE_PARAGRAPH < MAGIC_CODE_ZONE
 		if ( *sWord==MAGIC_CODE_SENTENCE || *sWord==MAGIC_CODE_PARAGRAPH || *sWord==MAGIC_CODE_ZONE )
 		{
-			// SPZ token has position and could be last token too
-			uPosition += ( iSPZ && *sWord>=iSPZ );
+			int iZone = -1;
 
 			if ( *sWord==MAGIC_CODE_ZONE )
 			{
@@ -2560,87 +3105,83 @@ static void TokenizeDocument ( TokenFunctorTraits_c & tFunctor, const CSphHTMLSt
 				pTokenizer->SetBufferPtr ( pZoneEnd );
 				pLastTokenEnd = pZoneEnd; // fix it up to prevent adding last chunk on exit
 
-#ifndef NDEBUG
-				AddZone ( pZoneStart, pZoneEnd, uPosition, tFunctor, dZoneStack, dZoneName, pStartPtr, dZonePos );
-#else
-				AddZone ( pZoneStart, pZoneEnd, uPosition, tFunctor, dZoneStack, dZoneName );
-#endif
+				iZone = AddZone ( pZoneStart, pZoneEnd, uPosition, tFunctor, dZoneStack, dZoneName, pStartPtr );
 			}
 
+			// SPZ token has position and could be last token too
 			if ( iSPZ && *sWord>=iSPZ )
 			{
-				tFunctor.OnSPZ ( *sWord, uPosition, dZoneName.Begin() );
-			}
+				tFunctor.OnSPZ ( *sWord, uPosition, dZoneName.Begin(), iZone );
+			} else
+				uStep = 0;
+
+			if ( *sWord==MAGIC_CODE_PARAGRAPH )
+				pLastTokenEnd = pTokenStart+1;
+
 			continue;
 		}
 
 		pLastTokenEnd = pTokenizer->GetTokenEnd ();
 		int iWordLen = pLastTokenEnd - pTokenStart;
 
-		// build wordids vector
-		// (exact form, blended, substrings all yield multiple ids)
-		// TODO! only doing exact currently; add everything else (blended/star) here too
-		CSphVector<SphWordID_t> dWordids;
-		dWordids.Add ( 0 ); // will be fixed up later with "primary" wordid
-		if ( tFunctor.m_bHighlightQuery && tFunctor.m_bIndexExactWords )
+		bool bPopExactMulti = false;
+		if ( tFunctor.m_bIndexExactWords )
 		{
-			int iBytes = iWordLen;
-			if ( iBytes+2>sizeof(sExactBuf) )
-				iBytes = sizeof(sExactBuf)-2;
-			memcpy ( sExactBuf + 1, sWord, iBytes );
-			sExactBuf[0] = MAGIC_WORD_HEAD_NONSTEMMED;
-			sExactBuf[iBytes+1] = '\0';
-			dWordids.Add ( pDict->GetWordIDNonStemmed ( sExactBuf ) );
+			BYTE sTmpBuf [ 3*SPH_MAX_WORD_LEN+4];
+			sTmpBuf[0] = MAGIC_WORD_HEAD_NONSTEMMED;
+			CopyString ( sTmpBuf+1, sWord, iWordLen );
+			dMultiToken.Add ( tFunctor.m_pDict->GetWordIDNonStemmed ( sTmpBuf ) );
+			bPopExactMulti = true;
 		}
 
-		int iNonStemmedLen = iWordLen;
-		if ( iNonStemmedLen+1>sizeof(sNonStemmed) )
-			iNonStemmedLen = sizeof(sNonStemmed)-1;
-
-		memcpy ( sNonStemmed, sWord, iNonStemmedLen );
-		sNonStemmed[iNonStemmedLen] = '\0';
 		// must be last because it can change (stem) sWord
-		SphWordID_t iWord = pDict->GetWordID ( sWord );
-		dWordids[0] = iWord;
+		CopyString ( sNonStemmed, sWord, iWordLen );
+		SphWordID_t iWord = tFunctor.m_pDict->GetWordID ( sWord );
+		tTok.m_uWordId = iWord;
+
+		tTok.m_bStopWord = false;
+		if ( !iWord )
+			tTok.m_bStopWord = pDict->IsStopWord ( sWord );
 
 		// compute position
-		if ( pTokenizer->GetBoundary() )
-			uPosition += tFunctor.m_iBoundaryStep;
+		if ( !iWord || tTok.m_bStopWord )
+			uStep = tFunctor.m_iStopwordStep;
+		else
+			uStep = 1;
 
-		bool bIsStopWord = false;
-		if ( !iWord )
-			bIsStopWord = pDict->IsStopWord ( sWord );
-
-		if ( iWord || bIsStopWord )
-			uPosition += bIsStopWord ? tFunctor.m_iStopwordStep : 1;
-
-		ExcerptGen_c::Token_t tDocTok;
-		tDocTok.m_eType = ( iWord || bIsStopWord ) ? ExcerptGen_c::TOK_WORD : ExcerptGen_c::TOK_SPACE;
-		tDocTok.m_uPosition = ( iWord || bIsStopWord ) ? uPosition : 0;
-		tDocTok.m_iStart = pTokenStart - pStartPtr;
-		tDocTok.m_iLengthBytes = tDocTok.m_iLengthCP = iWordLen;
-		if ( bUtf8 && ( iWord || bIsStopWord ) )
-			tDocTok.m_iLengthCP = sphUTF8Len ( pTokenStart, tDocTok.m_iLengthBytes );
-
-		if ( !pTokenizer->TokenIsBlendedPart() )
-		{
-			iBlendID = 0;
-			iBlendedExactID = 0;
-		} else
-		{
-			dWordids.Add ( iBlendID );
-			if ( iBlendedExactID )
-				dWordids.Add ( iBlendedExactID );
-		}
+		tTok.m_uPosition = ( iWord || tTok.m_bStopWord ) ? uPosition : 0;
+		tTok.m_iStart = pTokenStart - pStartPtr;
+		tTok.m_iLen = iWordLen;
+		tTok.m_bWord = !!iWord;
 
 		// match & emit
 		// star match needs non-stemmed word
-		tFunctor.OnToken ( tDocTok.m_iStart, tDocTok.m_iLengthBytes, sNonStemmed, tDocTok.m_uPosition, dWordids );
+		if ( !tFunctor.OnToken ( tTok, dMultiToken ) )
+		{
+			tFunctor.OnFinish();
+			return;
+		}
+
+		if ( bPopExactMulti )
+			dMultiToken.Pop();
 	}
 
 	// last space if any
+	if ( pLastTokenEnd<pBlendedEnd && bBlendedPart )
+	{
+		// FIXME!!! implement proper handling of blend-chars
+		tTok.m_uWordId = 0;
+		tTok.m_bStopWord = false;
+		tTok.m_uPosition = uPosition; // let's stick to last blended part, uPosition and not uPosition-1 as no iteration happened at exit
+		tTok.m_iStart = pLastTokenEnd - pStartPtr;
+		tTok.m_iLen = pBlendedEnd - pLastTokenEnd;
+		tTok.m_bWord = false;
+		tFunctor.OnToken ( tTok, dMultiToken );
+		pLastTokenEnd = pBlendedEnd;
+	}
+
 	if ( pLastTokenEnd!=pTokenizer->GetBufferEnd() )
-		tFunctor.OnTail ( pLastTokenEnd-pStartPtr, pTokenizer->GetBufferEnd() - pLastTokenEnd );
+		tFunctor.OnTail ( pLastTokenEnd-pStartPtr, pTokenizer->GetBufferEnd() - pLastTokenEnd, pTokenizer->GetBoundary() ? pTokenizer->GetBoundaryOffset() : -1 );
 
 	tFunctor.OnFinish();
 }
@@ -2667,7 +3208,7 @@ public:
 		m_iDocs = 0;
 		m_iHits = 0;
 		m_uLastPos = uLastPos;
-		if ( m_pHits )
+		if ( m_pHits && m_pHits->GetLength() )
 		{
 			m_iDocs = 1;
 			m_iHits = m_pHits->GetLength();
@@ -2683,8 +3224,8 @@ public:
 
 	virtual const CSphMatch & GetNextDoc ( DWORD * )
 	{
-		m_dQwordFields.Set();
-		m_tMatch.m_iDocID = !m_tMatch.m_iDocID && HasHits() ? 1 : 0;
+		m_dQwordFields.SetAll();
+		m_tMatch.m_uDocID = !m_tMatch.m_uDocID && HasHits() ? 1 : 0;
 		return m_tMatch;
 	}
 
@@ -2722,9 +3263,7 @@ public:
 
 	virtual bool QwordSetup ( ISphQword * pQword ) const
 	{
-		SnippetsFastQword_c * pWord = dynamic_cast<SnippetsFastQword_c *> ( pQword );
-		assert ( pWord );
-
+		SnippetsFastQword_c * pWord = (SnippetsFastQword_c *)pQword;
 		pWord->Setup ( m_pHiglighter->m_tContainer.m_uLastPos );
 		return true;
 	}
@@ -2737,22 +3276,172 @@ inline bool operator < ( const SphHitMark_t & a, const SphHitMark_t & b )
 }
 
 
-static char * HighlightAllFastpath ( const ExcerptQuery_t & tQuerySettings,
-	const CSphIndexSettings & tIndexSettings,
+// with sentence in query we should consider SENTECE, PARAGRAPH, ZONE
+// with paragraph in query we should consider PARAGRAPH, ZONE
+// with zone in query we should consider ZONE
+int ConvertSPZ ( DWORD eSPZ )
+{
+	if ( eSPZ & SPH_SPZ_SENTENCE )
+		return MAGIC_CODE_SENTENCE;
+	else if ( eSPZ & SPH_SPZ_PARAGRAPH )
+		return MAGIC_CODE_PARAGRAPH;
+	else if ( eSPZ & SPH_SPZ_ZONE )
+		return MAGIC_CODE_ZONE;
+	else
+		return 0;
+}
+
+
+static void EmitPassagesOrdered ( CSphVector<BYTE> & dResult, const CSphVector<BYTE> & dPassageText, const CSphVector<int> & dPassageHeads, CSphVector<Passage_t> & dPassages,
+	const CSphString & sChunkSeparator )
+{
+	int iSeparatorLen = sChunkSeparator.Length();
+	dResult.Reserve ( dPassageText.GetLength() + dPassageHeads.GetLength()*iSeparatorLen*2 );
+	dResult.Resize(0);
+
+	int iOutLen = dResult.GetLength();
+	dResult.Resize ( iOutLen+iSeparatorLen );
+	memcpy ( &dResult[iOutLen], sChunkSeparator.cstr(), iSeparatorLen );
+
+	ARRAY_FOREACH ( iPassage, dPassages )
+	{
+		int iBest = -1;
+		ARRAY_FOREACH ( i, dPassages )
+			if ( iBest==-1 || ( i!=iBest && dPassages[i].GetWeight()>=dPassages[iBest].GetWeight() ) )
+				iBest = i;
+
+		assert ( iBest!=-1 );
+
+		dPassages[iBest].m_iQwordCount = 0;
+		dPassages[iBest].m_iUniqQwords = 0;
+		dPassages[iBest].m_iQwordsWeight = 0;
+		dPassages[iBest].m_iMinGap = -1;
+
+		int iLen = ( iBest==dPassageHeads.GetLength()-1 ? dPassageText.GetLength() : dPassageHeads[iBest+1] ) - dPassageHeads[iBest];
+
+		iOutLen = dResult.GetLength();
+		dResult.Resize ( iOutLen+iLen );
+		memcpy ( &dResult[iOutLen], &(dPassageText[dPassageHeads[iBest]]), iLen );
+
+		iOutLen = dResult.GetLength();
+		dResult.Resize ( iOutLen+iSeparatorLen );
+		memcpy ( &dResult[iOutLen], sChunkSeparator.cstr(), iSeparatorLen );
+	}
+}
+
+
+static void HighlightPassages ( CacheStreamer_c & tStreamer, ExtractExcerpts_c & tExtractor, ExcerptQuery_t & tFixedSettings, const CSphIndexSettings & tIndexSettings, SnippetsDocIndex_c & tContainer,
+	const char * sDoc, int iDocLen, CSphDict * pDict, ISphTokenizer * pTokenizer, const CSphVector<SphHitMark_t> * dMarked, FunctorZoneInfo_t * pZoneInfo, CSphVector<BYTE> & dRes )
+{
+	tFixedSettings.m_bWeightOrder = tExtractor.m_bFixedWeightOrder;
+
+	if ( tExtractor.m_dPassages.GetLength() )
+	{
+		// 3rd pass: highlight passages
+		HighlightPassages_c tHighlighter ( tContainer, pTokenizer, pDict, tFixedSettings, tIndexSettings, sDoc, iDocLen, dMarked ? dMarked : &tExtractor.m_dCollectedHits,
+			tExtractor.m_dPassages, pZoneInfo );
+		tStreamer.Tokenize ( tHighlighter );
+
+		if ( tFixedSettings.m_bWeightOrder )
+		{
+			CSphVector<BYTE> dResult;
+			EmitPassagesOrdered ( dResult, tHighlighter.m_dResult, tHighlighter.m_dPassageHeads, tExtractor.m_dPassages, tFixedSettings.m_sChunkSeparator );
+			dRes.SwapData ( dResult );
+
+		} else
+			dRes.SwapData ( tHighlighter.m_dResult );
+
+	} else if ( !tFixedSettings.m_bAllowEmpty )
+	{
+		DocStartHighlighter_c tHighlighter ( tContainer, pTokenizer, pDict, tFixedSettings, tIndexSettings, sDoc, iDocLen );
+		tStreamer.Tokenize ( tHighlighter );
+
+		dRes.SwapData ( tHighlighter.m_dStartResult );
+	}
+}
+
+
+static void FixupQueryLimits ( const SnippetsDocIndex_c & tContainer, const ExcerptQuery_t & tQuerySettings, ExcerptQuery_t & tFixedSettings, CSphString & sWarning, DWORD uFoundTerms = 0 )
+{
+	if ( tQuerySettings.m_iLimitWords && ( tQuerySettings.m_bExactPhrase || tQuerySettings.m_bForceAllWords ) )
+	{
+		int iNewWordLimit = 0;
+
+		if ( !uFoundTerms )
+			iNewWordLimit = tContainer.GetNumTerms();
+		else
+		{
+			DWORD uFound = uFoundTerms;
+			for ( ; uFound; iNewWordLimit++ )
+				uFound &= uFound-1;
+		}
+
+		if ( iNewWordLimit > tQuerySettings.m_iLimitWords )
+		{
+			sWarning.SetSprintf ( "number of query terms (%d) is greater than the word limit setting (%d): limit increased", iNewWordLimit, tQuerySettings.m_iLimitWords );
+			tFixedSettings.m_iLimitWords = iNewWordLimit;
+		}
+	}
+
+	if ( tQuerySettings.m_iLimit )
+	{
+		int iTotalLen = 0;
+		int iMaxLen = 0;
+		int nTermsUsed = 0;
+
+		for ( int i = 0; i < tContainer.GetNumTerms(); i++ )
+		{
+			int iLenCP = tContainer.GetTermWeight(i);
+			if ( !uFoundTerms || ( uFoundTerms && ( uFoundTerms & ( 1UL << i ) ) ) )
+			{
+				iTotalLen += iLenCP;
+				iMaxLen = Max ( iMaxLen, iLenCP );
+				nTermsUsed++;
+			}
+		}
+
+		int iNewLimit = iMaxLen;
+		if ( tQuerySettings.m_bExactPhrase || tQuerySettings.m_bForceAllWords )
+			iNewLimit = iTotalLen+nTermsUsed-1;
+
+		if ( iNewLimit > tQuerySettings.m_iLimit )
+		{
+			sWarning.SetSprintf ( "query length (%d) is greater than the limit setting (%d): limit increased", iNewLimit, tQuerySettings.m_iLimit );
+			tFixedSettings.m_iLimit = iNewLimit;
+		}
+	}
+}
+
+
+static void DoHighlighting ( const ExcerptQuery_t & tQuerySettings,
+	const CSphIndexSettings & tIndexSettings, const XQQuery_t & tExtQuery, DWORD eExtQuerySPZ,
 	const char * sDoc, int iDocLen,
 	CSphDict * pDict, ISphTokenizer * pTokenizer, const CSphHTMLStripper * pStripper,
-	const CSphSchema * pSchema, CSphString & sError,
-	ISphTokenizer * pQueryTokenizer )
+	CSphString & sWarning, CSphString & sError, ISphTokenizer * pQueryTokenizer, CSphVector<BYTE> & dRes )
 {
+	assert ( !tIndexSettings.m_uAotFilterMask || ( !tQuerySettings.m_bExactPhrase && tQuerySettings.m_bHighlightQuery ) );
 	ExcerptQuery_t tFixedSettings ( tQuerySettings );
 
-	// exact_phrase is replaced by query_mode=1 + "query words"
-	if ( tQuerySettings.m_bExactPhrase )
+	// exact_phrase emulation
+	// bug of words is replaced by query_mode=1 + "query words"
+	XQQuery_t tExactPhraseQuery;
+	bool bPhraseEmulation = tQuerySettings.m_bExactPhrase;
+	if ( bPhraseEmulation )
 	{
 		if ( !tQuerySettings.m_bHighlightQuery && tQuerySettings.m_sWords.Length() && strchr ( tQuerySettings.m_sWords.cstr(), 0x22 )==NULL )
 			tFixedSettings.m_sWords.SetSprintf ( "\"%s\"", tQuerySettings.m_sWords.cstr() );
 
 		tFixedSettings.m_bHighlightQuery = true;
+
+		CSphSchema tSchema;
+		if ( !sphParseExtendedQuery ( tExactPhraseQuery, tFixedSettings.m_sWords.cstr(), NULL, pQueryTokenizer, &tSchema, pDict, tIndexSettings ) )
+		{
+			sError = tExactPhraseQuery.m_sParseError;
+			return;
+		}
+		sWarning = tExactPhraseQuery.m_sParseWarning;
+		if ( tExactPhraseQuery.m_pRoot )
+			tExactPhraseQuery.m_pRoot->ClearFieldMask();
 	}
 
 	bool bRetainHtml = ( tFixedSettings.m_sStripMode=="retain" );
@@ -2762,21 +3451,45 @@ static char * HighlightAllFastpath ( const ExcerptQuery_t & tQuerySettings,
 		pTokenizer->AddSpecials ( "<" );
 
 	// create query and hit lists container, parse query
-	SnippetsDocIndex_c tContainer ( tFixedSettings.m_bHighlightQuery );
-	if ( !tContainer.Parse ( tFixedSettings.m_sWords.cstr(), pQueryTokenizer, pDict, pSchema, sError, tIndexSettings.m_iStopwordStep ) )
-		return NULL;
+	SnippetsDocIndex_c tContainer ( tFixedSettings.m_bHighlightQuery, ( bPhraseEmulation ? tExactPhraseQuery : tExtQuery ) );
+	tContainer.ParseQuery ( tFixedSettings.m_sWords.cstr(), pQueryTokenizer, pDict, eExtQuerySPZ );
+
+	bool bHighlightAll = ( tFixedSettings.m_iLimit==0 || tFixedSettings.m_iLimit>=iDocLen ) && ( tFixedSettings.m_iLimitWords==0 || tFixedSettings.m_iLimitWords>iDocLen/2 )
+		&& tFixedSettings.m_ePassageSPZ==SPH_SPZ_NONE;
+
+	int iSPZ = ConvertSPZ ( eExtQuerySPZ | ( bHighlightAll ? 0 : tFixedSettings.m_ePassageSPZ ) );
 
 	// do highlighting
 	if ( !tFixedSettings.m_bHighlightQuery )
 	{
-		// simple bag of words query
-		// do just one tokenization pass over the document, matching and highlighting keywords
-		HighlightPlain_c tHighlighter ( tContainer, pTokenizer, pDict, tFixedSettings, tIndexSettings, sDoc, iDocLen );
-		TokenizeDocument ( tHighlighter, NULL );
+		if ( bHighlightAll )
+		{
+			// simple bag of words query
+			// do just one tokenization pass over the document (not storing any tokens), matching and highlighting keywords
+			HighlightPlain_c tHighlighter ( tContainer, pTokenizer, pDict, tFixedSettings, tIndexSettings, sDoc, iDocLen, iDocLen );
+			TokenizeDocument ( tHighlighter, NULL, 0 );
+
+			if ( !tHighlighter.m_iMatchesCount && tFixedSettings.m_bAllowEmpty )
+				tHighlighter.m_dResult.Reset();
+
+			dRes.SwapData ( tHighlighter.m_dResult );
+
+		} else
+		{
+			FixupQueryLimits ( tContainer, tQuerySettings, tFixedSettings, sWarning );
+
+			CacheStreamer_c tStreamer ( iDocLen );
+			ExtractExcerpts_c tExtractor ( tContainer, pTokenizer, pDict, tFixedSettings, tIndexSettings, sDoc, iDocLen, NULL, &tStreamer );
+			tExtractor.m_bCollectExtraZoneInfo = true;
+
+			TokenizeDocument ( tExtractor, pStripper, iSPZ );
+
+			tStreamer.m_pZoneInfo = &tExtractor.m_tZoneInfo;
+			HighlightPassages ( tStreamer, tExtractor, tFixedSettings, tIndexSettings, tContainer, sDoc, iDocLen, pDict, pTokenizer, NULL, &tExtractor.m_tZoneInfo, dRes );
+		}
 
 		// add trailing zero, and return
-		tHighlighter.m_dResult.Add ( 0 );
-		return (char*) tHighlighter.m_dResult.LeakData();
+		dRes.Add(0);
 
 	} else
 	{
@@ -2785,12 +3498,19 @@ static char * HighlightAllFastpath ( const ExcerptQuery_t & tQuerySettings,
 		// 1st pass will tokenize document, match keywords, and store positions into docindex
 		// 2nd pass will highlight matching positions only (with some matching engine aid)
 
+		CacheStreamer_c tStreamer ( iDocLen );
+
 		// do the 1st pass
-		HitCollector_c tHitCollector ( tContainer, pTokenizer, pDict, tFixedSettings, tIndexSettings, sDoc, iDocLen );
-		TokenizeDocument ( tHitCollector, pStripper );
+		HitCollector_c tHitCollector ( tContainer, pTokenizer, pDict, tFixedSettings, tIndexSettings, sDoc, iDocLen, tStreamer );
+		TokenizeDocument ( tHitCollector, pStripper, iSPZ );
+
+		FunctorZoneInfo_t * pZoneInfo = &tHitCollector.m_tZoneInfo;
+		tStreamer.m_pZoneInfo = pZoneInfo;
+
+		FixupQueryLimits ( tContainer, tQuerySettings, tFixedSettings, sWarning, tHitCollector.m_uFoundWords );
 
 		// prepare for the 2nd pass (that is, extract matching hits)
-		SnippetZoneChecker_c tZoneChecker ( tHitCollector.m_dZones, tHitCollector.m_hZones, tContainer.m_tQuery.m_dZones );
+		SnippetZoneChecker_c tZoneChecker ( tHitCollector.m_dZones, tHitCollector.m_tZoneInfo.m_hZones, tContainer.m_tQuery.m_dZones );
 
 		SnippetsFastQwordSetup_c tQwordSetup ( &tHitCollector );
 		tQwordSetup.m_pDict = pDict;
@@ -2798,9 +3518,25 @@ static char * HighlightAllFastpath ( const ExcerptQuery_t & tQuerySettings,
 		tQwordSetup.m_pWarning = &sError;
 		tQwordSetup.m_pZoneChecker = &tZoneChecker;
 
+		// got a lot of stack allocated variables (up to 30K)
+		// check that query not overflow stack here
+		if ( !sphCheckQueryHeight ( tContainer.m_tQuery.m_pRoot, sError ) )
+			return;
+
 		CSphScopedPtr<CSphHitMarker> pMarker ( CSphHitMarker::Create ( tContainer.m_tQuery.m_pRoot, tQwordSetup ) );
 		if ( !pMarker.Ptr() )
-			return NULL;
+		{
+			// no hits - just highlight document start
+			if ( !tFixedSettings.m_bAllowEmpty )
+			{
+				DocStartHighlighter_c tHighlighter ( tContainer, pTokenizer, pDict, tFixedSettings, tIndexSettings, sDoc, iDocLen );
+				tStreamer.Tokenize ( tHighlighter );
+
+				dRes.SwapData ( tHighlighter.m_dStartResult );
+			}
+			dRes.Add(0);
+			return;
+		}
 
 		CSphVector<SphHitMark_t> dMarked;
 		pMarker->Mark ( dMarked );
@@ -2853,33 +3589,63 @@ static char * HighlightAllFastpath ( const ExcerptQuery_t & tQuerySettings,
 		}
 		dMarked.Uniq();
 
-		// we just exploded spans into actual matching hits
-		// now lets fold marked and matched hits back into contiguous spans
-		// so that we could highlight such spans instead of every individual word
-		SphHitMark_t * pOut = dMarked.Begin(); // last emitted folded token
-		SphHitMark_t * pIn = dMarked.Begin() + 1; // next token to process
-		SphHitMark_t * pMax = dMarked.Begin() + dMarked.GetLength();
-		while ( pIn<pMax )
+		if ( !tQuerySettings.m_bExactPhrase )
 		{
-			if ( pIn->m_uPosition==( pOut->m_uPosition + pOut->m_uSpan ) )
+			// we just exploded spans into actual matching hits
+			// now lets fold marked and matched hits back into contiguous spans
+			// so that we could highlight such spans instead of every individual word
+			SphHitMark_t * pOut = dMarked.Begin(); // last emitted folded token
+			SphHitMark_t * pIn = dMarked.Begin() + 1; // next token to process
+			SphHitMark_t * pMax = dMarked.Begin() + dMarked.GetLength();
+			while ( pIn<pMax )
 			{
-				pOut->m_uSpan += pIn->m_uSpan;
-				pIn++;
-			} else
-			{
-				*++pOut = *pIn++;
+				if ( pIn->m_uPosition==( pOut->m_uPosition + pOut->m_uSpan ) )
+				{
+					pOut->m_uSpan += pIn->m_uSpan;
+					pIn++;
+				} else
+				{
+					*++pOut = *pIn++;
+				}
 			}
+			if ( dMarked.GetLength()>1 )
+				dMarked.Resize ( pOut - dMarked.Begin() + 1 );
 		}
-		if ( dMarked.GetLength()>1 )
-			dMarked.Resize ( pOut - dMarked.Begin() + 1 );
 
-		// 2nd pass
-		HighlightQuery_c tHighlighter ( tContainer, pTokenizer, pDict, tFixedSettings, tIndexSettings, sDoc, iDocLen, dMarked );
-		TokenizeDocument ( tHighlighter, pStripper );
+		if ( bHighlightAll )
+		{
+			// 2nd pass
+			HighlightQuery_c tHighlighter ( tContainer, pTokenizer, pDict, tFixedSettings, tIndexSettings, sDoc, iDocLen, dMarked );
+			tStreamer.Tokenize ( tHighlighter );
 
-		// add trailing zero, and return
-		tHighlighter.m_dResult.Add ( 0 );
-		return (char*) tHighlighter.m_dResult.LeakData();
+			if ( !tHighlighter.m_iMatchesCount && tFixedSettings.m_bAllowEmpty )
+				tHighlighter.m_dResult.Reset();
+
+			dRes.SwapData ( tHighlighter.m_dResult );
+
+		} else if ( !dMarked.GetLength() )
+		{
+			// no hits - just highlight document start
+			if ( !tFixedSettings.m_bAllowEmpty )
+			{
+				DocStartHighlighter_c tHighlighter ( tContainer, pTokenizer, pDict, tFixedSettings, tIndexSettings, sDoc, iDocLen );
+				tStreamer.Tokenize ( tHighlighter );
+
+				dRes.SwapData ( tHighlighter.m_dStartResult );
+			}
+
+		} else
+		{
+			ExtractExcerpts_c tExtractor ( tContainer, pTokenizer, pDict, tFixedSettings, tIndexSettings, sDoc, iDocLen, &dMarked, NULL );
+			tExtractor.m_bCollectExtraZoneInfo = false;
+			tExtractor.m_uFoundWords = tHitCollector.m_uFoundWords;
+
+			tStreamer.Tokenize ( tExtractor );
+
+			HighlightPassages ( tStreamer, tExtractor, tFixedSettings, tIndexSettings, tContainer, sDoc, iDocLen, pDict, pTokenizer, &dMarked, pZoneInfo, dRes );
+		}
+
+		dRes.Add(0);
 	}
 }
 
@@ -2895,7 +3661,6 @@ ExcerptQuery_t::ExcerptQuery_t ()
 	, m_iLimitPassages ( 0 )
 	, m_iAround ( 5 )
 	, m_iPassageId ( 1 )
-	, m_iPassageBoundary ( 0 )
 	, m_bRemoveSpaces ( false )
 	, m_bExactPhrase ( false )
 	, m_bUseBoundaries ( false )
@@ -2906,58 +3671,62 @@ ExcerptQuery_t::ExcerptQuery_t ()
 	, m_bAllowEmpty ( false )
 	, m_bEmitZones ( false )
 	, m_iRawFlags ( -1 )
+	, m_sFilePrefix ( "" )
 	, m_iSize ( 0 )
 	, m_iSeq ( 0 )
 	, m_iNext ( -2 )
-	, m_sRes ( NULL )
 	, m_bHasBeforePassageMacro ( false )
 	, m_bHasAfterPassageMacro ( false )
+	, m_ePassageSPZ ( SPH_SPZ_NONE )
 {
 }
 
 /////////////////////////////////////////////////////////////////////////////
 
 
-char * sphBuildExcerpt ( ExcerptQuery_t & tOptions, CSphDict * pDict, ISphTokenizer * pTokenizer, const CSphSchema * pSchema, CSphIndex * pIndex, CSphString & sError, const CSphHTMLStripper * pStripper, ISphTokenizer * pQueryTokenizer )
+void sphBuildExcerpt ( ExcerptQuery_t & tOptions, const CSphIndex * pIndex, const CSphHTMLStripper * pStripper, const XQQuery_t & tExtQuery,
+						DWORD eExtQuerySPZ, CSphString & sWarning, CSphString & sError, CSphDict * pDict, ISphTokenizer * pDocTokenizer, ISphTokenizer * pQueryTokenizer )
 {
 	if ( tOptions.m_sStripMode=="retain"
 		&& !( tOptions.m_iLimit==0 && tOptions.m_iLimitPassages==0 && tOptions.m_iLimitWords==0 ) )
 	{
 		sError = "html_strip_mode=retain requires that all limits are zero";
-		return NULL;
+		return;
 	}
-
-	if ( !tOptions.m_sWords.cstr()[0] )
-		tOptions.m_bHighlightQuery = false;
 
 	char * pData = const_cast<char*> ( tOptions.m_sSource.cstr() );
 	CSphFixedVector<char> pBuffer ( 0 );
-	int iDataLen = tOptions.m_sSource.Length();
 
 	if ( tOptions.m_iLoadFiles )
 	{
 		CSphAutofile tFile;
-		if ( tFile.Open ( tOptions.m_sSource.cstr(), SPH_O_READ, sError )<0 )
-			return NULL;
+		if ( tOptions.m_sFilePrefix!="" )
+		{
+			CSphString sFilename;
+			sFilename.SetSprintf ( "%s%s", tOptions.m_sFilePrefix.cstr(), tOptions.m_sSource.cstr() );
+			if ( tFile.Open ( sFilename.cstr(), SPH_O_READ, sError )<0 )
+				return;
+		} else if ( tOptions.m_sSource.IsEmpty() )
+		{
+			sError.SetSprintf ( "snippet file name is empty" );
+			return;
+		} else if ( tFile.Open ( tOptions.m_sSource.cstr(), SPH_O_READ, sError )<0 )
+			return;
 
 		// will this ever trigger? time will tell; email me if it does!
 		if ( tFile.GetSize()+1>=(SphOffset_t)INT_MAX )
 		{
 			sError.SetSprintf ( "%s too big for snippet (over 2 GB)", pData );
-			return NULL;
+			return;
 		}
 
 		int iFileSize = (int)tFile.GetSize();
-		if ( iFileSize<=0 )
-		{
-			static char sEmpty[] = "";
-			return sEmpty;
-		}
+		if ( iFileSize<0 )
+			return;
 
-		iDataLen = iFileSize+1;
-		pBuffer.Reset ( iDataLen );
+		pBuffer.Reset ( iFileSize+1 );
 		if ( !tFile.Read ( pBuffer.Begin(), iFileSize, sError ) )
-			return NULL;
+			return;
 
 		pBuffer[iFileSize] = 0;
 		pData = pBuffer.Begin();
@@ -2971,57 +3740,10 @@ char * sphBuildExcerpt ( ExcerptQuery_t & tOptions, CSphDict * pDict, ISphTokeni
 		pStripper = NULL;
 
 	// FIXME!!! check on real data (~100 Mb) as stripper changes len
-	iDataLen = strlen ( pData );
+	int iDataLen = strlen ( pData );
 
-	// fast path that highlights entire document
-	if (!( tOptions.m_iLimitPassages
-		|| ( tOptions.m_iLimitWords && tOptions.m_iLimitWords<iDataLen/2 )
-		|| ( tOptions.m_iLimit && tOptions.m_iLimit<=iDataLen )
-		|| tOptions.m_bForceAllWords || tOptions.m_bUseBoundaries ))
-	{
-		return HighlightAllFastpath ( tOptions, pIndex->GetSettings(), pData, iDataLen, pDict, pTokenizer, pStripper, pSchema, sError, pQueryTokenizer );
-	}
-
-	if ( !tOptions.m_bHighlightQuery )
-	{
-		// legacy highlighting
-		ExcerptGen_c tGenerator ( pTokenizer->IsUtf8() );
-		tGenerator.TokenizeQuery ( tOptions, pDict, pTokenizer, pIndex->GetSettings() );
-		tGenerator.SetExactPhrase ( tOptions );
-		tGenerator.TokenizeDocument ( pData, iDataLen, pDict, pTokenizer, true, tOptions, pIndex->GetSettings() );
-		return tGenerator.BuildExcerpt ( tOptions );
-	}
-
-	XQQuery_t tQuery;
-	if ( !sphParseExtendedQuery ( tQuery, tOptions.m_sWords.cstr(), pQueryTokenizer, pSchema, pDict, pIndex->GetSettings().m_iStopwordStep ) )
-	{
-		sError = tQuery.m_sParseError;
-		return NULL;
-	}
-	tQuery.m_pRoot->ClearFieldMask();
-
-	ExcerptGen_c tGenerator ( pTokenizer->IsUtf8() );
-	tGenerator.TokenizeDocument ( pData, iDataLen, pDict, pTokenizer, false, tOptions, pIndex->GetSettings() );
-
-	CSphScopedPtr<SnippetZoneChecker_c> pZoneChecker ( new SnippetZoneChecker_c ( tGenerator.GetZones(), tGenerator.GetZonesName(), tQuery.m_dZones ) );
-	SnippetsQwordSetup tSetup ( &tGenerator, pTokenizer );
-	CSphString sWarning;
-
-	tSetup.m_pDict = pDict;
-	tSetup.m_pIndex = pIndex;
-	tSetup.m_eDocinfo = SPH_DOCINFO_EXTERN;
-	tSetup.m_pWarning = &sWarning;
-	tSetup.m_pZoneChecker = pZoneChecker.Ptr();
-
-	CSphScopedPtr<CSphHitMarker> pMarker ( CSphHitMarker::Create ( tQuery.m_pRoot, tSetup ) );
-	if ( !pMarker.Ptr() )
-	{
-		sError = sWarning;
-		return NULL;
-	}
-
-	tGenerator.SetMarker ( pMarker.Ptr() );
-	return tGenerator.BuildExcerpt ( tOptions );
+	DoHighlighting ( tOptions, pIndex->GetSettings(), tExtQuery, eExtQuerySPZ, pData, iDataLen, pDict, pDocTokenizer, pStripper,
+		sWarning, sError, pQueryTokenizer, tOptions.m_dRes );
 }
 
 //

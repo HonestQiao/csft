@@ -28,18 +28,18 @@ index plain
 {
 	source			= src
     docinfo			= extern
-    charset_type	= utf-8
 	path			= <data_path/>/plain
-	stopwords		= test_154/stopwords.txt
+	stopwords		= <this_test/>/stopwords.txt
+	blend_chars = .
+	blend_mode = trim_both, trim_head	
 }
 
 index rt
 {
 	type			= rt
     docinfo			= extern
-    charset_type	= utf-8
 	path			= <data_path/>/rt
-	stopwords		= test_154/stopwords.txt
+	stopwords		= <this_test/>/stopwords.txt
 
 	rt_attr_uint	= idd1
 	rt_field		= body
@@ -71,7 +71,7 @@ DROP TABLE IF EXISTS `test_table`
 
 <db_insert>
 INSERT INTO `test_table` VALUES
-( 1, 11, 'a dog' ),
+( 1, 11, 'a dog.' ),
 ( 2, 11, 'a cat' ),
 ( 3, 11, 'a bird' ), 
 ( 4, 12, 'cat eats bird' ),

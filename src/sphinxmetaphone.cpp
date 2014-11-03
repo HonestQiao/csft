@@ -3,8 +3,8 @@
 //
 
 //
-// Copyright (c) 2001-2011, Andrew Aksyonoff
-// Copyright (c) 2008-2011, Sphinx Technologies Inc
+// Copyright (c) 2001-2014, Andrew Aksyonoff
+// Copyright (c) 2008-2014, Sphinx Technologies Inc
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -82,7 +82,8 @@ static bool StrAt ( const CurrentWord_t & Word, int iStart, int iLength, const c
 }
 
 
-static bool StrAt ( const CurrentWord_t & Word, int iStart, int iLength, const char * szStr1, const char * szStr2, const char * szStr3, const char * szStr4 )
+static bool StrAt ( const CurrentWord_t & Word, int iStart, int iLength, const char * szStr1,
+	const char * szStr2, const char * szStr3, const char * szStr4 )
 {
 	if ( iStart<0 || iStart>=Word.iLengthPadded )
 		return false;
@@ -92,7 +93,8 @@ static bool StrAt ( const CurrentWord_t & Word, int iStart, int iLength, const c
 		|| !strncmp ( szPos, szStr4, iLength );
 }
 
-static bool StrAt ( const CurrentWord_t & Word, int iStart, int iLength, const char * szStr1, const char * szStr2, const char * szStr3, const char * szStr4, const char * szStr5 )
+static bool StrAt ( const CurrentWord_t & Word, int iStart, int iLength, const char * szStr1,
+	const char * szStr2, const char * szStr3, const char * szStr4, const char * szStr5 )
 {
 	if ( iStart<0 || iStart>=Word.iLengthPadded )
 		return false;
@@ -171,8 +173,13 @@ static int ProcessCode ( int iCode, int iCur, CurrentWord_t & Word, BYTE * sPrim
 				ADD_RET ( "K", "X", 2 )
 
 			// greek roots e.g. 'chemistry', 'chorus'
-			if ( iCur==0 && ( StrAt ( Word, iCur+1, 5, "HARAC", "HARIS" ) || StrAt ( Word, iCur+1, 3, "HOR", "HYM", "HIA", "HEM" ) ) && !StrAt ( Word, 0, 5, "CHORE" ) )
+			if ( iCur==0
+				&& ( StrAt ( Word, iCur+1, 5, "HARAC", "HARIS" )
+					|| StrAt ( Word, iCur+1, 3, "HOR", "HYM", "HIA", "HEM" ) )
+				&& !StrAt ( Word, 0, 5, "CHORE" ) )
+			{
 				ADD_RET ( "K", "K", 2 )
+			}
 
 			// germanic, greek, or otherwise 'ch' for 'kh' sound
 			if ( ( StrAt ( Word, 0, 4, "VAN ", "VON " ) || StrAt ( Word, 0, 3, "SCH" ) )
@@ -376,8 +383,12 @@ static int ProcessCode ( int iCode, int iCur, CurrentWord_t & Word, BYTE * sPrim
 				if ( iCur==iLast )
 					ADD ( "J", "" );
 				else
-					if ( !StrAt ( Word, iCur+1, 1, "L", "T", "K", "S" ) && !StrAt ( Word, iCur+1, 1, "N", "M", "B", "Z" ) && !StrAt ( Word, iCur-1, 1, "S", "K", "L" ) )
+					if ( !StrAt ( Word, iCur+1, 1, "L", "T", "K", "S" )
+						&& !StrAt ( Word, iCur+1, 1, "N", "M", "B", "Z" )
+						&& !StrAt ( Word, iCur-1, 1, "S", "K", "L" ) )
+					{
 						ADD ( "J", "J" );
+					}
 			}
 		}
 
@@ -576,7 +587,7 @@ static int ProcessCode ( int iCode, int iCur, CurrentWord_t & Word, BYTE * sPrim
 }
 
 
-void stem_dmetaphone ( BYTE * pWord, bool bUTF8 )
+void stem_dmetaphone ( BYTE * pWord )
 {
 	BYTE	sOriginal [3*SPH_MAX_WORD_LEN+3];
 	BYTE	sPrimary [3*SPH_MAX_WORD_LEN+3];
@@ -615,41 +626,32 @@ void stem_dmetaphone ( BYTE * pWord, bool bUTF8 )
 		iAdvance = 1;
 	}
 
-	BYTE * pPtr = sOriginal;
-	BYTE * pLastPtr = sOriginal;
+	const BYTE * pPtr = sOriginal;
+	const BYTE * pLastPtr = sOriginal;
 	int iCode = -1;
 
-	if ( bUTF8 )
-		iCode = sphUTF8Decode ( pPtr );
+	iCode = sphUTF8Decode ( pPtr );
 
 	while ( iCode!=0 )
 	{
-		int iCur = ( bUTF8 ? pLastPtr : pPtr ) - sOriginal;
+		int iCur = pLastPtr-sOriginal;
 		if ( iCur>=iLength )
 			break;
 
-		if ( bUTF8 )
+		for ( int i = 0; i < iAdvance; ++i )
 		{
-			for ( int i = 0; i < iAdvance; ++i )
-			{
-				pLastPtr = pPtr;
-				iCode = sphUTF8Decode ( pPtr );
-			}
-
-		} else
-		{
-			pPtr += iAdvance;
-			iCode = *pPtr;
+			pLastPtr = pPtr;
+			iCode = sphUTF8Decode ( pPtr );
 		}
 
 		if ( iCode<=0 )
 			break;
 
 		// unknown code: don't copy, just return
-		if ( bUTF8 && iCode>128 && iCode!=0xC7 && iCode!=0xE7 && iCode!=0xD1 && iCode!=0xF1 )
+		if ( iCode>128 && iCode!=0xC7 && iCode!=0xE7 && iCode!=0xD1 && iCode!=0xF1 )
 			return;
 
-		iAdvance = ProcessCode ( iCode, ( bUTF8 ? pLastPtr : pPtr ) - sOriginal, Word, sPrimary, sSecondary );
+		iAdvance = ProcessCode ( iCode, pLastPtr-sOriginal, Word, sPrimary, sSecondary );
 	}
 
 	if ( !pWord[0] || sPrimary [0] )

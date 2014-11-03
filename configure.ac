@@ -1,7 +1,7 @@
 dnl Process this file with autoconf to produce a configure script.
 
 AC_PREREQ(2.59)
-AC_INIT([sphinx], [1.11], [shodan(at)shodan.ru])
+AC_INIT([sphinx], [2.2.6], [shodan(at)sphinxsearch.com])
 
 dnl --------------------------------------------------------------------------
 
@@ -28,11 +28,11 @@ AC_ARG_WITH([debug],
 
 AC_MSG_CHECKING([whether to compile debug version])
 if test x$ac_cv_use_debug != xno; then
-	SPHINX_CFLAGS="-Wall -g -D_FILE_OFFSET_BITS=64"
+	SPHINX_CFLAGS="-fno-rtti -Wall -g -D_FILE_OFFSET_BITS=64"
 	SPHINX_INJECT_FLAGS="-D_FILE_OFFSET_BITS=64"
 	AC_MSG_RESULT([yes])
 else
-	SPHINX_CFLAGS="-Wall -g -D_FILE_OFFSET_BITS=64 -O3 -DNDEBUG"
+	SPHINX_CFLAGS="-fno-rtti -Wall -g -D_FILE_OFFSET_BITS=64 -O3 -DNDEBUG"
 	SPHINX_INJECT_FLAGS="-D_FILE_OFFSET_BITS=64 -DNDEBUG"
 	AC_MSG_RESULT([no])
 fi
@@ -57,18 +57,19 @@ AC_PROG_CC
 AC_PROG_CXX
 AC_PROG_RANLIB
 
-AC_COMPILE_IFELSE([
+AC_COMPILE_IFELSE([AC_LANG_SOURCE([
 #ifdef __GNUC__
 #if __GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ > 3)
-void main() {}
+int main() {}
 #else
 syntax error
 #endif
 #endif
-], [], [AC_MSG_ERROR([Gcc version error. Minspec is 3.4])])
+])], [], [AC_MSG_ERROR([Gcc version error. Minspec is 3.4])])
 
 AC_DEFINE_UNQUOTED([COMPILER],"$CC `$CC -dumpversion`",[Define to be the name of the compiler.])
 AC_DEFINE_UNQUOTED([OS_UNAME],"`uname -a`",[Full name OS])
+AC_DEFINE_UNQUOTED([CONFIGURE_FLAGS],"$ac_configure_args",[Flags used to configure me])
 
 dnl --------------------------------------------------------------------------
 
@@ -77,7 +78,7 @@ SPHINX_CONFIGURE_PART([checking for header files])
 # Checks for header files.
 AC_HEADER_STDC
 AC_HEADER_SYS_WAIT
-AC_CHECK_HEADERS([fcntl.h limits.h netdb.h netinet/in.h stdlib.h string.h sys/file.h sys/socket.h sys/time.h unistd.h pthread.h execinfo.h])
+AC_CHECK_HEADERS([fcntl.h limits.h netdb.h netinet/in.h stdlib.h string.h sys/file.h sys/socket.h sys/time.h unistd.h pthread.h execinfo.h sys/epoll.h])
 AC_CHECK_HEADER(expat.h,[have_expat_h=yes],[have_expat_h=no])
 AC_CHECK_HEADER(iconv.h,[have_iconv_h=yes],[have_iconv_h=no])
 AC_CHECK_HEADER(zlib.h,[have_zlib_h=yes],[have_zlib_h=no])
@@ -110,12 +111,21 @@ AC_FUNC_STAT
 AC_FUNC_VPRINTF
 AC_SEARCH_LIBS([setsockopt],[socket])
 AC_SEARCH_LIBS([gethostbyname],[nsl socket resolv])
-AC_SEARCH_LIBS([XML_Parse],[expat],[have_libexpat=yes],[have_libexpat=no])
-AC_SEARCH_LIBS([iconv],[iconv],[have_libiconv=yes],[have_libiconv=no])
 AC_SEARCH_LIBS([inflate],[z],[have_lz=yes],[have_lz=no])
 AC_SEARCH_LIBS([logf],[m])
-AC_CHECK_FUNCS([dup2 gethostbyname gettimeofday memmove memset select socket strcasecmp strchr strerror strncasecmp strstr strtol logf pread])
+AC_CHECK_FUNCS([dup2 gethostbyname gettimeofday memmove memset select socket strcasecmp strchr strerror strncasecmp strnlen strstr strtol logf pread poll])
 AC_CHECK_FUNCS([backtrace backtrace_symbols])
+
+# Neither defined or undefined. So, check.
+if test "z$ac_cv_func_epoll" != "zno" && test "z$ac_cv_func_epoll" != "zyes" ; then
+	AC_CHECK_FUNCS(epoll_ctl, [ac_cv_func_epoll=yes], )
+fi
+
+if test "x$ac_cv_func_epoll" = "xyes" && test "x$ac_cv_header_sys_epoll_h" = "xyes" ; then
+	AC_DEFINE(HAVE_EPOLL, 1,
+		[Define if your system supports the epoll system calls])
+	AC_LIBOBJ(epoll)
+fi
 
 # most systems require the program be linked with librt library to use
 # the function clock_gettime 
@@ -136,14 +146,70 @@ SPHINX_CHECK_DEFINE(F_SETLKW,fcntl.h)
 # check for dlopen
 # FIXME! technically, only needed in searchd
 # but as UDF manager is curently in libsphinx, we link everything
-AC_CHECK_LIB(dl,dlopen)
+AC_SEARCH_LIBS([dlopen],[dl dld],[],[])
 AC_CHECK_FUNCS(dlopen dlerror)
+
+
+# check for interlocked increment and decrement in linux
+
+dnl helper that runs a test program and checks for success
+interlocked_prog="
+
+int interlocked_routine ( )
+{
+	volatile int ia=0;
+    __sync_fetch_and_add( &ia, 1 ); // atomic increment
+	__sync_fetch_and_sub( &ia, 1 ); // atomic decrement
+}
+
+int main ()
+{
+	int m = interlocked_routine();
+	return 0;
+}
+"
+
+# check the availability of needed function
+AC_CACHE_CHECK([for interlocked builtins], [sphinx_cv_interlocked],
+[
+	AC_TRY_RUN($interlocked_prog, [sphinx_cv_interlocked=yes], [sphinx_cv_interlocked=no], [
+		AC_COMPILE_IFELSE([AC_LANG_SOURCE($interlocked_prog)], [sphinx_cv_interlocked=yes], [sphinx_cv_interlocked=no])
+	])
+])
+
+# final check
+if test x$sphinx_cv_interlocked = xyes; then
+    AC_DEFINE(HAVE_SYNC_FETCH,1,[Whether we have internal atomic functions])
+fi
 
 dnl --------------------------------------------------------------------------
 
 SPHINX_CONFIGURE_PART([configuring Sphinx])
 
-dnl ---
+dnl -----------
+dnl Whether we use runtime dlopen for loading dynamic external libs like mysql, posgres, etc.
+dnl instead of hard linking on build.
+
+AC_MSG_CHECKING([Whether to use dl lib to load mysql, posgres and other libs])
+sph_usedl=no
+AC_ARG_ENABLE([dl],
+    [  --enable-dl             dynamically load the libs like mysql, posgresql and may be others instead of linking them with binary during the build.],
+    [ac_cv_use_dl_libs=$enableval])
+
+if test x$ac_cv_use_dl_libs == xyes ; then
+	if test x$ac_cv_func_dlopen == xyes ; then
+	    AC_MSG_RESULT([yes])
+		sph_usedl=yes
+	else
+		AC_MSG_RESULT([not possible (no dlopen)])
+	fi
+else
+    AC_MSG_RESULT([no])
+fi
+
+dnl --- 
+
+
 
 # check for pthreads
 
@@ -176,7 +242,7 @@ if test x$cross_compiling = xno ; then
 		$1
 	fi
 else
-	AC_COMPILE_IFELSE($pthread_prog, [pthreads_try_compile=yes], [pthreads_try_compile=no], [pthreads_try_compile=no])
+	AC_COMPILE_IFELSE([AC_LANG_SOURCE($pthread_prog)], [pthreads_try_compile=yes], [pthreads_try_compile=no], [pthreads_try_compile=no])
 	if test x$pthreads_try_compile = xyes ; then
 		$1
 	fi
@@ -191,7 +257,7 @@ if test x$cross_compiling = xno ; then
 		$1
 	fi
 else
-	AC_LINK_IFELSE($pthread_prog, [pthreads_try_link=yes], [pthreads_try_link=no], [pthreads_try_link=no])
+	AC_LINK_IFELSE([AC_LANG_SOURCE($pthread_prog)], [pthreads_try_link=yes], [pthreads_try_link=no], [pthreads_try_link=no])
 	if test x$pthreads_try_link = xyes ; then
 		$1
 	fi
@@ -259,66 +325,112 @@ AC_ARG_WITH([mysql],
             AC_HELP_STRING([--with-mysql], [compile with MySQL support (default is enabled)]),
             [ac_cv_use_mysql=$withval], [ac_cv_use_mysql=yes]
 )
-AC_MSG_CHECKING([whether to compile with MySQL support])
-if test x$ac_cv_use_mysql != xno; then
-	AC_MSG_RESULT([yes])
-    AC_CHECK_MYSQL([$ac_cv_use_mysql])
-    AC_DEFINE(USE_MYSQL,1,[Define to 1 if you want to compile with MySQL support])
-    AC_SUBST([MYSQL_LIBS])
-    AC_SUBST([MYSQL_CFLAGS])
-else
-	AC_MSG_RESULT([no])
-fi
-AM_CONDITIONAL(USE_MYSQL, test x$ac_cv_use_mysql != xno)
 
 # check if we should statically link the mysql library
 AC_ARG_WITH([static-mysql], 
             AC_HELP_STRING([--with-static-mysql], [link statically with MySQL library (default is no)]),
             [ac_cv_use_static_mysql=$withval], [ac_cv_use_static_mysql=no]
 )
-AC_MSG_CHECKING([whether to link statically with MySQL support])
-if test x$ac_cv_use_mysql != xno; then
-if test x$ac_cv_use_static_mysql != xno; then
-	AC_CHECK_MYSQL([$ac_cv_use_static_mysql])
-	MYSQL_LIBS=`echo $MYSQL_LIBS | sed -e 's/\-Bdynamic/\-Bstatic/g'`
-	MYSQL_LIBS="-Wl,-Bstatic $MYSQL_LIBS -Wl,-Bdynamic"
-	AC_MSG_RESULT([yes])
+
+AC_MSG_CHECKING([whether to compile with MySQL support])
+if test  x$ac_cv_use_static_mysql != xno -o x$ac_cv_use_mysql != xno
+then
+	dl_mysql=0
+	if test x$ac_cv_use_static_mysql != xno ; then
+		AC_MSG_RESULT([static])
+    	AC_CHECK_MYSQL([$ac_cv_use_static_mysql])
+		MYSQL_LIBS=`echo $MYSQL_LIBS | sed -e "sX-lmysqlclientX\$MYSQL_PKGLIBDIR/libmysqlclient.aXg"`
+	else
+		if test x$sph_usedl == xyes ; then
+			AC_MSG_RESULT([runtime dynamic])
+			AC_CHECK_MYSQL([$ac_cv_use_mysql])
+			MYSQL_LIBS=""
+			dl_mysql=1
+		else
+			AC_MSG_RESULT([dynamic])
+			AC_CHECK_MYSQL([$ac_cv_use_mysql])
+		fi
+	fi
+    AC_DEFINE(USE_MYSQL,1,[Define to 1 if you want to compile with MySQL support])
+	AC_DEFINE_UNQUOTED(DL_MYSQL,$dl_mysql,[Define to 1 if you want runtime load mysql using dlopen])
+    AC_SUBST([MYSQL_LIBS])
+    AC_SUBST([MYSQL_CFLAGS])
 else
 	AC_MSG_RESULT([no])
 fi
-fi
+AM_CONDITIONAL(USE_MYSQL, test x$ac_cv_use_mysql != xno -o x$ac_cv_use_static_mysql != xno )
+
+dnl ---
+
+AC_ARG_WITH([syslog],
+    AC_HELP_STRING([--with-syslog], [compile with possibility to use syslog for logging (default is yes)]),
+    [ac_cv_use_syslog=$withval], [ac_cv_use_syslog=yes]
+)
+AC_MSG_CHECKING([for Syslog])
+if test [ $ac_cv_use_syslog != no ]; then
+    if test [ $have_syslog_h = yes ]; then
+        AC_DEFINE([USE_SYSLOG],1,[define to use POSIX Syslog for logging])
+        AC_MSG_RESULT([yes])
+    else
+        AC_MSG_RESULT([no])
+    fi
+else
+    AC_MSG_RESULT([disabled])
+fi    
 
 # check if we should compile with PostgreSQL support
 AC_ARG_WITH([pgsql],
             AC_HELP_STRING([--with-pgsql], [compile with PostgreSQL support (default is disabled)]),
             [ac_cv_use_pgsql=$withval], [ac_cv_use_pgsql=no]
 )
+# check if we should statically link the PostgreSQL library
+AC_ARG_WITH([static-pgsql], 
+            AC_HELP_STRING([--with-static-pgsql], [link statically with PostgreSQL library (default is no)]),
+            [ac_cv_use_static_pgsql=$withval], [ac_cv_use_static_pgsql=no]
+)
 AC_MSG_CHECKING([whether to compile with PostgreSQL support])
-if test x$ac_cv_use_pgsql != xno; then
-	AC_MSG_RESULT([yes])
-    AC_CHECK_PGSQL([$ac_cv_use_pgsql])
+if test x$ac_cv_use_static_pgsql != xno -o x$ac_cv_use_pgsql != xno
+then
+	dl_pgsql=0
+	if test x$ac_cv_use_static_pgsql != xno ; then
+		AC_MSG_RESULT([static])
+		AC_CHECK_PGSQL([$ac_cv_use_static_pgsql])
+		PGSQL_LIBS=`echo $PGSQL_LIBS | sed -e "sX-lpqX$PGSQL_PKGLIBDIR/libpq.aXg"`
+	else
+		if test x$sph_usedl == xyes ; then
+			AC_MSG_RESULT([runtime dynamic])
+			AC_CHECK_PGSQL([ac_cv_use_pgsql])
+			PGSQL_LIBS=""
+			dl_pgsql=1
+		else
+			AC_MSG_RESULT([dynamic])
+			AC_CHECK_PGSQL([ac_cv_use_pgsql])
+		fi
+	fi
     AC_DEFINE(USE_PGSQL,1,[Define to 1 if you want to compile with PostgreSQL support])
+	AC_DEFINE_UNQUOTED(DL_PGSQL,$dl_pgsql,[Define to 1 if runtime load PosgreSQL using dlopen])
     AC_SUBST([PGSQL_LIBS])
     AC_SUBST([PGSQL_CFLAGS])
 else
 	AC_MSG_RESULT([no])
 fi
-AM_CONDITIONAL(USE_PGSQL, test x$ac_cv_use_pgsql != xno)
+AM_CONDITIONAL(USE_PGSQL, test x$ac_cv_use_pgsql != xno -o x$ac_cv_use_satic_pgsql != xno )
 
 # add macports include directory
 if (echo $MYSQL_LIBS | grep -q -- -L/opt/local/lib); then
    MYSQL_CFLAGS="$MYSQL_CFLAGS -I/opt/local/include"
 fi
 
-# we can now set preprocessor flags for both C and C++ compilers
-CPPFLAGS="$CPPFLAGS $MYSQL_CFLAGS $PGSQL_CFLAGS"
+# get rid of possible garbage (like on mac os x)
+MYSQL_CFLAGS=`echo $MYSQL_CFLAGS | sed -e 's/-O[[0123sz]]//g'`
+MYSQL_CFLAGS=`echo $MYSQL_CFLAGS | sed -e 's/\-DNDEBUG//g'`
 
 dnl ---
 
 AC_MSG_CHECKING([whether to use 64-bit document/word IDs])
-sph_enable_id64=no
+sph_enable_id64=yes
 AC_ARG_ENABLE([id64],
-	[  --enable-id64           use 64-bit document and word IDs (default is no)],
+	[  --enable-id64           use 64-bit document and word IDs (default is yes)],
 	[sph_enable_id64=$enableval])
 if test x$sph_enable_id64 != xno; then
 	AC_DEFINE(USE_64BIT, 1, [64-bit document and word IDs])
@@ -337,34 +449,122 @@ AC_ARG_WITH([libstemmer],
 
 AC_MSG_CHECKING([whether to compile with libstemmer support])
 if test x$ac_cv_use_libstemmer != xno; then
-	if test -d libstemmer_c && test -f libstemmer_c/include/libstemmer.h; then
-		AC_MSG_RESULT([yes])
-		AC_DEFINE(USE_LIBSTEMMER, 1, [libstemmer support])
+	ac_cv_use_internal_libstemmer=no
+	AC_CHECK_LIBSTEMMER([$ac_cv_use_libstemmer])
+	if test x$ac_cv_use_internal_libstemmer != xno ; then
+		AC_MSG_RESULT([yes, static internal])
 	else
-		AC_MSG_ERROR([missing libstemmer sources from libstemmer_c.
-
-Please download the C version of libstemmer library from
-http://snowball.tartarus.org/ and extract its sources over libstemmer_c/
-subdirectory in order to build Sphinx with libstemmer support.
-])
+		AC_MSG_RESULT([yes, external])
 	fi
+	AC_DEFINE(USE_LIBSTEMMER, 1, [libstemmer support])
+	AC_SUBST([LIBSTEMMER_LIBS])
+	AC_SUBST([LIBSTEMMER_CFLAGS])
 else
 	AC_MSG_RESULT([no])
 	AC_DEFINE(USE_LIBSTEMMER, 0, [libstemmer support])
 fi
 AM_CONDITIONAL(USE_LIBSTEMMER, test x$ac_cv_use_libstemmer != xno)
+AM_CONDITIONAL(USE_INTERNAL_LIBSTEMMER, test x$ac_cv_use_internal_libstemmer != xno)
+
+
+dnl ---
+
+# we can now set preprocessor flags for both C and C++ compilers
+CPPFLAGS="$CPPFLAGS $MYSQL_CFLAGS $PGSQL_CFLAGS $LIBSTEMMER_CFLAGS"
+
+
+AC_ARG_WITH([libexpat],
+	AC_HELP_STRING([--with-libexpat], [compile with expat XML library suppport (default is autodetect)]),
+	[ac_cv_use_expat=$withval], [ac_cv_use_expat=yes]
+)
+
+
+dnl ---
+
+AC_ARG_WITH([re2],
+	AC_HELP_STRING([--with-re2], [compile with re2 library support (default is disabled)]),
+	[ac_cv_use_re2=$withval], [ac_cv_use_re2=no]
+)
+
+AC_MSG_CHECKING([whether to compile with re2 library support])
+
+AC_ARG_WITH([re2-includes],
+	AC_HELP_STRING([--with-re2-includes], [path to re2 header files]),
+	[ac_cv_re2_includes=$withval], [ac_cv_re2_includes=no]
+)
+
+AC_ARG_WITH([re2-libs],
+        AC_HELP_STRING([--with-re2-libs], [path to re2 libraries]),
+        [ac_cv_re2_libs=$withval], [ac_cv_re2_libs=no]
+)
+
+# First check if user supplied --with-re2-libs and --with-re2-includes
+if test x$ac_cv_re2_libs != xno && test x$ac_cv_re2_includes != xno; then
+       ac_cv_use_re2=yes
+fi
+
+if test x$ac_cv_use_re2 != xno; then
+       AC_CHECK_RE2
+       AC_MSG_RESULT([yes, $LIBRE2_CFLAGS])
+       AC_DEFINE(USE_RE2, 1, [RE2 library support])
+       AC_SUBST([LIBRE2_LIBS])
+       AC_SUBST([LIBRE2_CFLAGS])
+       AC_SUBST([LIBRE2_PATH])
+else
+	AC_MSG_RESULT([no])
+	AC_DEFINE(USE_RE2, 0, [re2 library support])
+fi
+AM_CONDITIONAL(USE_RE2, test x$ac_cv_use_re2 != xno)
+
+dnl ---
+
+# we can now set preprocessor flags for both C and C++ compilers
+CPPFLAGS="$CPPFLAGS $MYSQL_CFLAGS $PGSQL_CFLAGS $LIBRE2_CFLAGS"
+
+AC_ARG_WITH([rlp],
+	AC_HELP_STRING([--with-rlp], [compile with RLP library support (default is disabled)]),
+	[ac_cv_use_rlp=$withval], [ac_cv_use_rlp=no]
+)
+
+AC_MSG_CHECKING([whether to compile with RLP library support])
+if test x$ac_cv_use_rlp != xno; then
+	if test -d rlp && test -f rlp/rlp/include/bt_rlp_c.h; then
+		AC_MSG_RESULT([yes])
+		AC_DEFINE(USE_RLP, 1, [RLP library support])
+	else
+		AC_MSG_ERROR([missing RLP sources from librlp])
+	fi
+else
+	AC_MSG_RESULT([no])
+	AC_DEFINE(USE_RLP, 0, [RLP library support])
+fi
+AM_CONDITIONAL(USE_RLP, test x$ac_cv_use_rlp != xno)
+
 
 dnl ---
 
 got_expat=0
+dl_expat=0
 AC_MSG_CHECKING([for libexpat])
-if test [ $have_expat_h = yes -a $have_libexpat = yes ]; then
-	AC_DEFINE([USE_LIBEXPAT],1,[define to use expat XML library])
-	AC_MSG_RESULT([found])
-	got_expat=1
+if test x$ac_cv_use_expat = xyes -a x$have_expat_h = xyes; then
+	FOOLIBS="$LIBS"
+	AC_SEARCH_LIBS([XML_Parse],[expat],[got_expat=1])
+	if test $got_expat -eq 1; then
+		if test x$sph_usedl == xyes ; then
+			AC_MSG_RESULT([runtime dynamic])
+			LIBS="$FOOLIBS"
+			dl_expat=1
+		else
+			AC_MSG_RESULT([found])
+		fi
+		AC_DEFINE([USE_LIBEXPAT],1,[define to use expat XML library])
+		AC_DEFINE_UNQUOTED(DL_EXPAT,$dl_expat,[Define to 1 if you want runtime load libexpat using dlopen])
+	else
+		AC_MSG_RESULT([not found])
+		AC_MSG_WARN([xmlpipe2 will NOT be available])
+	fi
 else
-	AC_MSG_RESULT([not found])
-	AC_MSG_WARN([xmlpipe2 will NOT be available])
+	AC_MSG_RESULT([disabled])
 fi
 
 dnl ---
@@ -374,50 +574,50 @@ AC_ARG_WITH([iconv],
 	[ac_cv_use_iconv=$withval], [ac_cv_use_iconv=yes]
 )
 AC_MSG_CHECKING([for libiconv])
-if test [ $have_iconv_h = yes \
-	-a $have_libiconv = yes \
-	-a $got_expat -eq 1 \
-	-a $ac_cv_use_iconv != no ]; \
-then
-	AC_DEFINE([USE_LIBICONV],1,[define to use iconv library])
-	AC_MSG_RESULT([found])
+if test x$ac_cv_use_iconv != xno -a x$have_iconv_h = xyes; then
+	AC_SEARCH_LIBS([iconv],[iconv],[have_libiconv=yes],[have_libiconv=no])
+	if test x$have_libiconv = xyes; then
+		AC_MSG_RESULT([found])
+		AC_DEFINE([USE_LIBICONV],1,[define to use iconv library])
 
-	AC_MSG_CHECKING([for iconv() arg types])
-	AC_LANG_PUSH([C++])
-	AC_COMPILE_IFELSE(
-		[AC_LANG_PROGRAM([[
-			#include <iconv.h>	
-			#include <stdio.h>]],
-			[const char * inbuf;
-			iconv_t cd;
-			iconv ( cd, &inbuf, NULL, NULL, NULL );
-			])],
-		[iconv_inbuf_const=yes],
-		[iconv_inbuf_const=no])
-	AC_LANG_POP([C++])
-	if test [ $iconv_inbuf_const = yes ]; then
-		AC_DEFINE([ICONV_INBUF_CONST],1,[whether 2nd arg to iconv() is const ptr])
-		AC_MSG_RESULT([const char **])
+		AC_MSG_CHECKING([for iconv() arg types])
+		AC_LANG_PUSH([C++])
+		AC_COMPILE_IFELSE(
+			[AC_LANG_PROGRAM([[
+				#include <iconv.h>	
+				#include <stdio.h>]],
+				[const char * inbuf;
+				iconv_t cd;
+				iconv ( cd, &inbuf, NULL, NULL, NULL );
+				])],
+			[iconv_inbuf_const=yes],
+			[iconv_inbuf_const=no])
+		AC_LANG_POP([C++])
+		if test x$iconv_inbuf_const = xyes; then
+			AC_DEFINE([ICONV_INBUF_CONST],1,[whether 2nd arg to iconv() is const ptr])
+			AC_MSG_RESULT([const char **])
+		else
+			AC_DEFINE([ICONV_INBUF_CONST],0,[whether 2nd arg to iconv() is const ptr])
+			AC_MSG_RESULT([char **])
+		fi
 	else
-		AC_DEFINE([ICONV_INBUF_CONST],0,[whether 2nd arg to iconv() is const ptr])
-		AC_MSG_RESULT([char **])
+		if test $got_expat -eq 1; then
+			AC_MSG_RESULT([not found])
+			AC_MSG_WARN([xmlpipe2 will only support default encodings (latin-1, utf-8)])
+		else
+			AC_MSG_RESULT([not required and not found])
+		fi
 	fi
 else
-	if test [ $got_expat -eq 1 ]; then
-		if test [ $ac_cv_use_iconv = no ]; then
-			AC_MSG_RESULT([disabled])
-		else
-			AC_MSG_RESULT([not found])
-		fi
+	AC_MSG_RESULT([disabled])
+	if test $got_expat -eq 1; then
 		AC_MSG_WARN([xmlpipe2 will only support default encodings (latin-1, utf-8)])
-	else
-		AC_MSG_RESULT([not required])
 	fi
 fi
 
 dnl ---
 
-if test [ $have_zlib_h = yes -a $have_lz = yes ]; then
+if test x$have_zlib_h = xyes -a x$have_lz = xyes; then
    AC_DEFINE([USE_ZLIB],1,[define to use Zlib])
 fi
 
@@ -427,17 +627,28 @@ AC_ARG_WITH([unixodbc],
 	AC_HELP_STRING([--with-unixodbc], [compile with UnixODBC support (default is autodetect)]),
 	[ac_cv_use_unixodbc=$withval], [ac_cv_use_unixodbc=yes]
 )
+dl_odbc=0
 AC_MSG_CHECKING([for UnixODBC])
-if test [ $ac_cv_use_unixodbc != no ]; then
-	if test [ $have_sql_h = yes ]; then
-		AC_SEARCH_LIBS([SQLConnect],[odbc iodbc],[have_libodbc=yes],[have_libodbc=no])
-		if test [ $have_libodbc = yes ]; then
-			AC_DEFINE([USE_ODBC],1,[define to use ODBC library])
-			AC_MSG_RESULT([found])
+if test x$ac_cv_use_unixodbc = xyes; then
+	have_libodbc=no
+	FOOLIBS="$LIBS"
+	if test x$have_sql_h = xyes; then
+		AC_SEARCH_LIBS([SQLDriverConnect],[odbc iodbc],[have_libodbc=yes])
+	fi
+
+	if test x$have_libodbc = xyes; then
+		if test x$sph_usedl == xyes ; then
+			AC_MSG_RESULT([runtime dynamic])
+			LIBS="$FOOLIBS"
+			dl_odbc=1
 		else
-			AC_MSG_RESULT([not found])
-			AC_MSG_WARN([ODBC source support will NOT be available])
+			AC_MSG_RESULT([found])
 		fi
+		AC_DEFINE([USE_ODBC],1,[define to use ODBC library])
+		AC_DEFINE_UNQUOTED(DL_UNIXODBC,$dl_odbc,[Define to 1 if you want runtime load odbc/iodbc using dlopen])
+	else
+		AC_MSG_RESULT([not found])
+		AC_MSG_WARN([ODBC source support will NOT be available])
 	fi
 else
 	AC_MSG_RESULT([disabled])
@@ -445,14 +656,28 @@ fi
 
 dnl ---
 
+AC_MSG_CHECKING([whether to enable c++ memory routines override])
+sph_enable_mem_override=yes
+AC_ARG_ENABLE([mem-override],
+    [ --enable-mem-override   enable to override std c++ mem routines in production build (default is yes). Disabling may help in some rare cases as statically linking with mysql on Mac OS X Lion.],
+    [sph_enable_mem_override=$enableval])
+if test x$sph_enable_mem_override = xyes; then
+    AC_MSG_RESULT([yes])
+else
+    AC_DEFINE(SPH_DONT_OVERRIDE_MEMROUTINES, 1, [Disable overriding of c++ memory routines])
+    AC_MSG_RESULT([no])
+fi
+
+dnl --- 
+
 
 AC_ARG_WITH([syslog],
-	AC_HELP_STRING([--with-syslog], [compile with possibility to use syslog for logging (default is no)]),
-	[ac_cv_use_syslog=$withval], [ac_cv_use_syslog=no]
+	AC_HELP_STRING([--with-syslog], [compile with possibility to use syslog for logging (default is yes)]),
+	[ac_cv_use_syslog=$withval], [ac_cv_use_syslog=yes]
 )
 AC_MSG_CHECKING([for Syslog])
-if test [ $ac_cv_use_syslog != no ]; then
-	if test [ $have_syslog_h = yes ]; then
+if test x$ac_cv_use_syslog != xno; then
+	if test x$have_syslog_h = xyes; then
 		AC_DEFINE([USE_SYSLOG],1,[define to use POSIX Syslog for logging])
 		AC_MSG_RESULT([yes])
 	else
@@ -505,14 +730,14 @@ AC_C_BIGENDIAN(
 	AC_DEFINE(USE_LITTLE_ENDIAN, 0, [big-endian]),
 	AC_DEFINE(USE_LITTLE_ENDIAN, 1, [little-endian]),
 	AC_MSG_ERROR(unknown endianess not supported),
-	AC_MSG_ERROR(universial endianess not supported)
+	AC_MSG_ERROR(universal endianess not supported)
 )
 
 dnl --------------------------------------------------------------------------
 
 SPHINX_CONFIGURE_PART([generating configuration files])
 
-if test "$prefix" = "NONE"; then
+if test "x$prefix" = "xNONE"; then
 	my_op_prefix="/var"
 else
 	my_op_prefix="$localstatedir"

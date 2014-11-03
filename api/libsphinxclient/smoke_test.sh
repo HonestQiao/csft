@@ -1,9 +1,10 @@
 #!/bin/sh
 
-FAILLOG="/tmp/faillog1"
+[ "z$FAILLOG" = "z" ] && FAILLOG="/tmp/faillog"
 DIFF='smoke_diff.txt'
 RES='smoke_test.txt'
 REF='smoke_ref.txt'
+SHELL='/bin/sh'
 LINE='-----------------------------\n'
 
 die()
@@ -14,7 +15,9 @@ die()
 	echo "C API:$1"
 	[ -e "$FAILLOG" ] && rm $FAILLOG
 	
-	cmd "../../src/searchd -c smoke_test.conf --stop"
+	stop="../../src/searchd -c smoke_test.conf --stop"
+    echo "Executing: $stop\n">$FAILLOG
+    eval "$stop" 1>>$FAILLOG 2>&1
 	exit 1
 }
 
@@ -24,7 +27,7 @@ cmd ()
         eval $1 1>>$FAILLOG 2>&1 || die "$2" "$3"
 }
 
-cmd "./configure --with-debug" "configure failed"
+cmd "$SHELL ./configure --with-debug" "configure failed"
 cmd "make clean" "make clean failed"
 cmd "make" "make failed"
 
@@ -45,4 +48,3 @@ rm $FAILLOG
 
 echo "all ok"
 exit 0
-

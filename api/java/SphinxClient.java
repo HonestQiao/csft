@@ -4,8 +4,8 @@
  * Java version of Sphinx searchd client (Java API)
  *
  * Copyright (c) 2007, Vladimir Fedorkov
- * Copyright (c) 2007-2011, Andrew Aksyonoff
- * Copyright (c) 2008-2011, Sphinx Technologies Inc
+ * Copyright (c) 2007-2014, Andrew Aksyonoff
+ * Copyright (c) 2008-2014, Sphinx Technologies Inc
  * All rights reserved
  *
  * This program is free software; you can redistribute it and/or modify
@@ -13,6 +13,11 @@
  * received a copy of the GPL license along with this program; if you
  * did not, you can find it at http://www.gnu.org/
  */
+
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+//							WARNING
+// We strongly recommend you to use SphinxQL instead of the API
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 package org.sphx.api;
 
@@ -42,7 +47,8 @@ public class SphinxClient
 	public final static int SPH_RANK_MATCHANY		= 5;
 	public final static int SPH_RANK_FIELDMASK		= 6;
 	public final static int SPH_RANK_SPH04			= 7;
-	public final static int SPH_RANK_TOTAL			= 8;
+	public final static int SPH_RANK_EXPR			= 8;
+	public final static int SPH_RANK_TOTAL			= 9;
 
 	/* sorting modes */
 	public final static int SPH_SORT_RELEVANCE		= 0;
@@ -89,7 +95,7 @@ public class SphinxClient
 	private final static int VER_MAJOR_PROTO		= 0x1;
 	private final static int VER_COMMAND_SEARCH		= 0x119;
 	private final static int VER_COMMAND_EXCERPT	= 0x102;
-	private final static int VER_COMMAND_UPDATE		= 0x102;
+	private final static int VER_COMMAND_UPDATE		= 0x103;
 	private final static int VER_COMMAND_KEYWORDS	= 0x100;
 	private final static int VER_COMMAND_FLUSHATTRS	= 0x100;
 
@@ -136,6 +142,7 @@ public class SphinxClient
 	private ArrayList	_reqs;
 	private Map			_indexWeights;
 	private int			_ranker;
+	private String		_rankexpr;
 	private int			_maxQueryTime;
 	private Map			_fieldWeights;
 	private Map			_overrideTypes;
@@ -158,7 +165,7 @@ public class SphinxClient
 
 		_offset	= 0;
 		_limit	= 20;
-		_mode	= SPH_MATCH_ALL;
+		_mode	= SPH_MATCH_EXTENDED2;
 		_sort	= SPH_SORT_RELEVANCE;
 		_sortby	= "";
 		_minId	= 0;
@@ -193,6 +200,7 @@ public class SphinxClient
 		_indexWeights	= new LinkedHashMap();
 		_fieldWeights	= new LinkedHashMap();
 		_ranker			= SPH_RANK_PROXIMITY_BM25;
+		_rankexpr		= "";
 
 		_overrideTypes	= new LinkedHashMap();
 		_overrideValues	= new LinkedHashMap();
@@ -489,9 +497,10 @@ public class SphinxClient
 		_maxQueryTime = maxTime;
 	}
 
-	/** Set matching mode. */
+	/** Set matching mode. DEPRECATED */
 	public void SetMatchMode(int mode) throws SphinxException
 	{
+		System.out.println ( "DEPRECATED: Do not call this method or, even better, use SphinxQL instead of an API\n" );
 		myAssert (
 			mode==SPH_MATCH_ALL ||
 			mode==SPH_MATCH_ANY ||
@@ -504,9 +513,10 @@ public class SphinxClient
 	}
 
 	/** Set ranking mode. */
-	public void SetRankingMode ( int ranker ) throws SphinxException
+	public void SetRankingMode ( int ranker, String rankexpr ) throws SphinxException
 	{
 		myAssert ( ranker>=0 && ranker<SPH_RANK_TOTAL, "unknown ranker value; use one of the SPH_RANK_xxx constants" );
+		_rankexpr = ( rankexpr==null ) ? "" : rankexpr;
 		_ranker = ranker;
 	}
 
@@ -722,11 +732,12 @@ public class SphinxClient
 	}
 
 	/**
-	 * Set attribute values override (one override list per attribute).
+	 * DEPRECATED: Set attribute values override (one override list per attribute).
 	 * @param values maps Long document IDs to Int/Long/Float values (as specified in attrtype).
 	 */
 	public void SetOverride ( String attrname, int attrtype, Map values ) throws SphinxException
 	{
+		System.out.println ( "DEPRECATED: Do not call this method. Use SphinxQL REMAP() function instead.\n" );
 		myAssert ( attrname!=null && attrname.length()>0, "attrname must not be empty" );
 		myAssert ( attrtype==SPH_ATTR_INTEGER || attrtype==SPH_ATTR_TIMESTAMP || attrtype==SPH_ATTR_BOOL || attrtype==SPH_ATTR_FLOAT || attrtype==SPH_ATTR_BIGINT,
 			"unsupported attrtype (must be one of INTEGER, TIMESTAMP, BOOL, FLOAT, or BIGINT)" );
@@ -819,6 +830,9 @@ public class SphinxClient
 			out.writeInt(_limit);
 			out.writeInt(_mode);
 			out.writeInt(_ranker);
+			if ( _ranker == SPH_RANK_EXPR ) {
+				writeNetUTF8(out, _rankexpr);
+			}
 			out.writeInt(_sort);
 			writeNetUTF8(out, _sortby);
 			writeNetUTF8(out, query);
@@ -1212,11 +1226,12 @@ public class SphinxClient
 	 * @param attrs		array with the names of the attributes to update
 	 * @param values	array of updates; each long[] entry must contains document ID
 	 *					in the first element, and all new attribute values in the following ones
+	 * @param ignorenonexistent	the flag whether to silently ignore non existent columns up update request
 	 * @return			-1 on failure, amount of actually found and updated documents (might be 0) on success
 	 *
 	 * @throws			SphinxException on invalid parameters
 	 */
-	public int UpdateAttributes ( String index, String[] attrs, long[][] values ) throws SphinxException
+	public int UpdateAttributes ( String index, String[] attrs, long[][] values, boolean ignorenonexistent ) throws SphinxException
 	{
 		/* check args */
 		myAssert ( index!=null && index.length()>0, "no index name provided" );
@@ -1236,6 +1251,7 @@ public class SphinxClient
 			writeNetUTF8 ( req, index );
 
 			req.writeInt ( attrs.length );
+			req.writeInt ( ignorenonexistent ? 1 : 0 );
 			for ( int i=0; i<attrs.length; i++ )
 			{
 				writeNetUTF8 ( req, attrs[i] );
@@ -1294,11 +1310,12 @@ public class SphinxClient
 	 * @param docid		id of document to update
 	 * @param attrs		array with the names of the attributes to update
 	 * @param values		array of updates; each int[] entry must contains all new attribute values
+	 * @param ignorenonexistent	the flag whether to silently ignore non existent columns up update request
 	 * @return			-1 on failure, amount of actually found and updated documents (might be 0) on success
 	 *
 	 * @throws			SphinxException on invalid parameters
 	 */
-	public int UpdateAttributesMVA ( String index, long docid, String[] attrs, int[][] values ) throws SphinxException
+	public int UpdateAttributesMVA ( String index, long docid, String[] attrs, int[][] values, boolean ignorenonexistent ) throws SphinxException
 	{
 		/* check args */
 		myAssert ( index!=null && index.length()>0, "no index name provided" );
@@ -1319,6 +1336,7 @@ public class SphinxClient
 			writeNetUTF8 ( req, index );
 
 			req.writeInt ( attrs.length );
+			req.writeInt ( ignorenonexistent ? 1 : 0 );
 			for ( int i=0; i<attrs.length; i++ )
 			{
 				writeNetUTF8 ( req, attrs[i] );
@@ -1358,7 +1376,15 @@ public class SphinxClient
 		}
 	}
 	
+	public int UpdateAttributes ( String index, String[] attrs, long[][] values ) throws SphinxException
+	{
+		return UpdateAttributes ( index, attrs, values, false );
+	}
 
+	public int UpdateAttributesMVA ( String index, long docid, String[] attrs, int[][] values ) throws SphinxException
+	{
+		return UpdateAttributesMVA ( index, docid, attrs, values, false );
+	}
 
 	/**
      * Connect to searchd server, and generate keyword list for a given query.

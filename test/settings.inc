@@ -8,7 +8,6 @@ $sd_query_log		= "query.log";
 $sd_read_timeout	= 5;
 $sd_max_children	= 30;
 $sd_pid_file		= "searchd.pid";
-$sd_max_matches		= 100000;
 
 $agent_address		= "127.0.0.1";
 $agent_port			= 6713;
@@ -28,6 +27,9 @@ $index_data_path	= "data";
 
 $g_model	= false;
 $g_id64		= false;
+$g_re2		= false;
+$g_rlp		= false;
+$g_odbc     = false;
 $g_strict	= false;
 $g_skipdemo = false;
 $g_usemarks = true; // that we mark the output of every test in the searchd.log and query.log
@@ -81,6 +83,47 @@ function GuessIdSize ()
 	$g_id64 = strstr ( $banner[0], 'id64' ) !== false;
 }
 
+function GuessFeature ($config, $testmsg)
+{
+    global $g_locals;
+
+    exec ( $g_locals['indexer'].' --quiet --config '.$config.' --all', $output, $result );
+    if ( count($output) == 0 )
+    {
+        print "ERROR: failed to run the indexer\n";
+        exit ( 1 );
+    }
+
+    $flag = true;
+    foreach ( $output as $str )
+    {
+        if ( strstr ( $str, $testmsg ) )
+        {
+            $flag = false;
+            break;
+        }
+    }
+    return $flag;
+}
+
+function GuessRE2 ()
+{
+	global $g_re2;
+    $g_re2 = GuessFeature ('test_re.conf','no regexp support compiled');
+}
+
+function GuessRLP ()
+{
+	global $g_rlp;
+    $g_rpl = GuessFeature ( 'test_rlp.conf','no RLP support compiled');
+}
+
+function GuessODBC ()
+{
+    global $g_odbc;
+    $g_odbc = GuessFeature ( 'test_odbc.conf','failed to configure some of the sources');
+}
+
 function GetVersion ()
 {
 	$banner = GetBanner();
@@ -99,6 +142,16 @@ function PublishLocals ( $locals, $benchmark )
 	}
 	
 	$text = @file_get_contents ( getenv('HOME') . '/.sphinx' );
+	if ( !$text )
+	{
+		$path = '';
+		if ( $windows )
+			$path = $benchmark ? '..\\bin\\release\\' : '..\\bin\\debug\\';
+		else
+			$path = '../src/';
+	
+		$text = @file_get_contents ( $path . '/.sphinx' );
+	}
 	if ( $text )
 	{
 		eval('$init = array ' . $text . ';');

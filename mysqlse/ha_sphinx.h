@@ -27,7 +27,7 @@ struct CSphReqQuery;
 struct CSphSEShare;
 struct CSphSEAttr;
 struct CSphSEStats;
-struct CSphSEThreadData;
+struct CSphSEThreadTable;
 
 /// Sphinx SE handler class
 class ha_sphinx : public handler
@@ -127,7 +127,11 @@ public:
 	THR_LOCK_DATA **		store_lock ( THD * thd, THR_LOCK_DATA ** to, enum thr_lock_type lock_type );
 
 public:
+#if MYSQL_VERSION_ID<50610
 	virtual const COND *	cond_push ( const COND *cond );
+#else
+	virtual const Item *		cond_push ( const Item *cond );
+#endif	
 	virtual void			cond_pop ();
 
 private:
@@ -151,7 +155,7 @@ private:
 	bool			UnpackStats ( CSphSEStats * pStats );
 	bool			CheckResponcePtr ( int iLen );
 
-	CSphSEThreadData *	GetTls ();
+	CSphSEThreadTable *	GetTls ();
 };
 
 

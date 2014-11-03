@@ -1,7 +1,9 @@
 #!/bin/sh
 
+SHELL='/bin/sh'
+
 jobs=$(grep -c processor /proc/cpuinfo)
-FAILLOG="/tmp/faillog"
+[ "z$FAILLOG" = "z" ] && FAILLOG="/tmp/faillog"
 LINE="-------------------------------\n"
 if [ q"1" = q"$jobs" ] ; then
     jobs=""
@@ -31,12 +33,14 @@ cmd ()
 	cmd1 "$FAILLOG" "$1" "$2" "$3" 
 }
 
-cmd "mysql -u root test < example.sql" "Documents setup failed"
+cmd "mysql -utest test < example.sql" "Documents setup failed. Log in into mysql as admin and perform: CREATE DATABASE test; CREATE USER test@localhost; GRANT ALL PRIVILEGES ON test.* TO test@localhost;"
 
-for CONFARGS in "--with-debug" "--with-debug --enable-id64";
+export CC='gcc -ftrapv'
+export CXX='g++ -ftrapv'
+for CONFARGS in "--with-debug" "--with-debug --disable-id64" "--with-debug --with-unixodbc";
 do
 	BANNER="testing $CONFARGS build"
-	cmd "./configure $CONFARGS" "$BANNER: configure failed"
+	cmd "$SHELL ./configure $CONFARGS" "$BANNER: configure failed"
 	cmd "make clean" "$BANNER: make clean failed" 
 	cmd "make $jobs" "$BANNER: make failed" 
 
@@ -46,9 +50,11 @@ do
 	cmd "cd ./src; ./tests" "$BANNER: unit tests failed" 
 	cd ..
 	
-	cmd "cd ./api/libsphinxclient; ./smoke_test.sh" "$BANNER: C API tests failed"
+	cmd "cd ./api/libsphinxclient; ./smoke_test.sh" "$BANNER: C API tests failed" "pwd; cat smoke_diff.txt"
 	cd ../../ 
 done
+unset CXX
+unset CC
 
 make clean 1>/dev/null 2>&1
 [ -e "$FAILLOG" ] && rm "$FAILLOG"

@@ -26,8 +26,7 @@ index test
 {
 	source			= srctest
 	path			= <data_path/>/test
-    charset_type 	= utf-8
-	exceptions		= test_165/synonyms.txt
+	exceptions		= <this_test/>/synonyms.txt
 }
 
 source srcstar
@@ -42,12 +41,48 @@ index star
 {
 	source			= srcstar
 	path			= <data_path/>/star
-    charset_type 	= utf-8
-	exceptions		= test_165/synonyms2.txt
-	enable_star = 1
+	charset_table	= 0..9, A..Z->a..z, _, a..z, U+410..U+42F->U+430..U+44F, U+430..U+44F, *, %, ?
+	exceptions		= <this_test/>/synonyms2.txt
 	min_prefix_len = 1
 }
 
+index snip
+{
+	source			= srctest
+	path			= <data_path/>/snip
+	exceptions		= <this_test/>/synonyms3.txt
+}
+
+source src_wild1
+{
+	type			= mysql
+	<sql_settings/>
+
+	sql_query		= SELECT 1 as id, 11 as idd, '50% of 20% not 30* found' as text
+	sql_attr_uint = idd
+}
+
+index wild1
+{
+	source				= src_wild1
+	path					= <data_path/>/wild1
+	charset_table	= a..z, _, A..Z->a..z
+}
+
+source src_e
+{
+	type			= mysql
+	<sql_settings/>
+
+	sql_query		= SELECT 1, 'life:) on mars'
+}
+
+index e
+{
+	source			= src_e
+	path			= <data_path/>/e
+	exceptions		= test_165/synonyms4.txt
+}
 </config>
 
 <db_create>
@@ -86,7 +121,8 @@ INSERT INTO `star_table` VALUES
 ( 1,  'action*packed movies are not for family' ),
 ( 2,  'action movies are mostly blockbasters' ),
 ( 3,  'action packed movies published recently' ),
-( 4,  'recent DVD pack as collection' )
+( 4,  'recent DVD pack as collection' ),
+( 5,  'a?c x%z' )
 </db_insert>
 
 
@@ -107,6 +143,37 @@ INSERT INTO `star_table` VALUES
 <sphinxql>select * from star where match ('mov*')</sphinxql>
 <sphinxql>select * from star where match ('pack*')</sphinxql>
 <sphinxql>select * from star where match ('action')</sphinxql>
+
+<!-- regression tokenizer produces wrong token prt with exception -->
+<sphinxql>CALL SNIPPETS('; the test', 'snip', ';doggy the', 1 as force_all_words )</sphinxql>
+<sphinxql>CALL SNIPPETS('; the test', 'snip', 'doggy the', 1 as force_all_words )</sphinxql>
+<sphinxql>CALL SNIPPETS('; the test', 'snip', 'doggy the', 0 as force_all_words )</sphinxql>
+
+<sphinxql>select * from star where match ('a?c')</sphinxql>
+<sphinxql>select * from star where match ('x%z')</sphinxql>
+
+<!-- regression tokenizer produces wild chracters -->
+<sphinxql>select * from wild1 where match ('50? of 20% not 30* found')</sphinxql>
+<sphinxql>show meta</sphinxql>
+
+<!-- regression special vs synonym -->
+<sphinxql>select * from e where match ('life:\\)')</sphinxql>
+<sphinxql>show meta</sphinxql>
+
+<!-- regression escaped vs exception -->
+<sphinxql>select * from test where match ('so\\/dome')</sphinxql>
+<sphinxql>SHOW META</sphinxql>
+<sphinxql>select * from test where match ('si\\/dome')</sphinxql>
+<sphinxql>SHOW META</sphinxql>
+<sphinxql>select * from test where match ('X\\/dome')</sphinxql>
+<sphinxql>SHOW META</sphinxql>
+
+<!-- regression on exceptions ended with specials -->
+<sphinxql>select * from test where match('one')</sphinxql>
+<sphinxql>show meta</sphinxql>
+<sphinxql>select * from test where match('"one"')</sphinxql>
+<sphinxql>show meta</sphinxql>
+
 </sphqueries>
 
 </test>

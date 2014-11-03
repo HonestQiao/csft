@@ -26,10 +26,6 @@ index test_idx
 	path			= <Data_Path/>/test
 
     <Dynamic>
-      <Variant>	charset_type	= utf-8</Variant>
-      <Variant>	charset_type	= sbcs</Variant>
-    </Dynamic>
-    <Dynamic>
       <Variant>	min_word_len	= 1</Variant>
       <Variant>	min_word_len	= 3</Variant>
     </Dynamic>
@@ -38,7 +34,7 @@ index test_idx
       <Variant>	</Variant>
     </Dynamic>
     <Dynamic>
-      <Variant>	synonyms		= synonyms.txt </Variant>
+      <Variant>	exceptions		= synonyms.txt </Variant>
       <Variant>	</Variant>
     </Dynamic>
 
@@ -78,8 +74,7 @@ $opts = array
     "after_match" => "[A]",
     "chunk_separator" => " ... ",
     "limit" => 100,
-    "around" => 2,
-	"allow_empty"=>true
+    "around" => 2
 );
 
 $results = array ();
@@ -98,9 +93,8 @@ $opts = array
     "after_match" => "[A]",
     "chunk_separator" => " ... ",
     "limit" => 50,
-    "around" => 2,
-	"allow_empty"=>true	
-);
+    "around" => 2
+	);
 
 $results [] = $opts;
 $res = $client->BuildExcerpts ( $docs, "test_idx", $words, $opts );
@@ -117,8 +111,7 @@ $opts = array
     "after_match" => "[A]",
     "chunk_separator" => " ... ",
     "limit" => 30,
-    "around" => 2,
-	"allow_empty"=>true
+    "around" => 2
 );
 
 $results [] = $opts;
